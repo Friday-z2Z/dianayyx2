@@ -173,7 +173,7 @@ onMounted(() => {
             <polyline points="15 18 9 12 15 6"/>
           </svg>
         </button>
-        <h1 class="nav-title">AI 魔法棒</h1>
+        <h1 class="nav-title">魔法棒</h1>
         <div class="nav-spacer"></div>
       </header>
 

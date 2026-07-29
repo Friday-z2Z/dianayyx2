@@ -14,7 +14,7 @@ const menuGroups = ref([
   {
     title: '服务',
     items: [
-      { icon: 'magic', title: 'AI 魔法棒', subtitle: '智能创作助手', badge: 'NEW', badgeType: 'accent', highlight: true, action: 'magic-wand' },
+      { icon: 'magic', title: '魔法棒', subtitle: '智能创作助手', badge: 'NEW', badgeType: 'accent', highlight: true, action: 'magic-wand' },
       { icon: 'star', title: '我的收藏', badge: '12', badgeType: 'count' },
       { icon: 'history', title: '浏览历史' },
       { icon: 'download', title: '我的下载' }
