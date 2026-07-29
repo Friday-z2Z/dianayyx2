@@ -3,6 +3,7 @@ import vue from '@vitejs/plugin-vue'
 
 // https://vite.dev/config/
 export default defineConfig({
+    base: '/dianayyx2/',  // GitHub Pages 子路径
   plugins: [vue()],
   server: {
     proxy: {
