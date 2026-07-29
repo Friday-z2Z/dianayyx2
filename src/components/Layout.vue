@@ -1,5 +1,5 @@
 <script setup>
-import { ref, provide } from 'vue'
+import { ref, provide, shallowRef, watch } from 'vue'
 import TabBar from './TabBar.vue'
 import Home from '../views/Home.vue'
 import Profile from '../views/Profile.vue'
@@ -7,37 +7,47 @@ import MagicWand from '../views/MagicWand.vue'
 
 const activeTab = ref('home')
 const currentPage = ref('main') // 'main', 'magic-wand'
+const slideDirection = ref('')
+
+// 使用 shallowRef 避免对组件对象进行深度响应式转换
+const currentTabComponent = shallowRef(Home)
+
+watch(activeTab, (newTab) => {
+  currentTabComponent.value = newTab === 'home' ? Home : Profile
+}, { immediate: true })
 
 const handleTabChange = (tabId) => {
+  if (tabId === activeTab.value) return
+  slideDirection.value = tabId === 'home' ? 'slide-right' : 'slide-left'
   activeTab.value = tabId
 }
 
 const navigateTo = (page) => {
+  slideDirection.value = 'slide-left'
   currentPage.value = page
 }
 
-// 提供导航方法给子组件
 provide('navigateTo', navigateTo)
 provide('goBack', () => {
+  slideDirection.value = 'slide-right'
   currentPage.value = 'main'
 })
 </script>
 
 <template>
   <div class="layout">
-    <!-- 主内容区域 -->
     <main class="main-content">
-      <transition name="fade" mode="out-in">
-        <!-- 主页面 -->
+      <transition :name="slideDirection" mode="out-in">
         <div v-if="currentPage === 'main'" key="main" class="page-wrapper">
-          <transition name="fade" mode="out-in">
-            <Home v-if="activeTab === 'home'" key="home" />
-            <Profile v-else-if="activeTab === 'profile'" key="profile" />
-          </transition>
+          <div class="tab-content">
+            <transition name="tab-switch" mode="out-in">
+              <KeepAlive>
+                <component :is="currentTabComponent" :key="activeTab" />
+              </KeepAlive>
+            </transition>
+          </div>
           <TabBar :active-tab="activeTab" @change="handleTabChange" />
         </div>
-        
-        <!-- AI魔法棒页面 -->
         <MagicWand v-else-if="currentPage === 'magic-wand'" key="magic-wand" />
       </transition>
     </main>
@@ -46,32 +56,68 @@ provide('goBack', () => {
 
 <style scoped>
 .layout {
-  min-height: 100vh;
+  height: 100vh;
   display: flex;
   flex-direction: column;
-  background: var(--bg);
+  background: var(--color-bg);
 }
 
 .main-content {
   flex: 1;
-  overflow-y: auto;
-  -webkit-overflow-scrolling: touch;
+  overflow: hidden;
+  position: relative;
 }
 
 .page-wrapper {
-  min-height: 100vh;
+  height: 100%;
   display: flex;
   flex-direction: column;
 }
 
-/* 页面切换动画 */
-.fade-enter-active,
-.fade-leave-active {
-  transition: opacity 0.2s ease;
+.tab-content {
+  flex: 1;
+  overflow: hidden;
+  position: relative;
 }
 
-.fade-enter-from,
-.fade-leave-to {
+/* Page slide transitions */
+.slide-left-enter-active,
+.slide-left-leave-active,
+.slide-right-enter-active,
+.slide-right-leave-active {
+  transition: all var(--duration-normal) var(--ease-out-expo);
+}
+
+.slide-left-enter-from {
   opacity: 0;
+  transform: translateX(40px);
+}
+.slide-left-leave-to {
+  opacity: 0;
+  transform: translateX(-40px);
+}
+
+.slide-right-enter-from {
+  opacity: 0;
+  transform: translateX(-40px);
+}
+.slide-right-leave-to {
+  opacity: 0;
+  transform: translateX(40px);
+}
+
+/* Tab switch transition */
+.tab-switch-enter-active,
+.tab-switch-leave-active {
+  transition: all var(--duration-fast) var(--ease-smooth);
+}
+
+.tab-switch-enter-from {
+  opacity: 0;
+  transform: translateY(8px);
+}
+.tab-switch-leave-to {
+  opacity: 0;
+  transform: translateY(-8px);
 }
 </style>
