@@ -24,7 +24,7 @@ for _proxy_key in ('HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'AL
     os.environ.pop(_proxy_key, None)
 os.environ['NO_PROXY'] = '*'
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 
 import requests as _requests
@@ -48,7 +48,11 @@ _session = _requests.Session()
 _session.trust_env = False
 _session.proxies = {'http': None, 'https': None}
 
-app = Flask(__name__)
+# ==================== 静态文件服务（打包后部署） ====================
+# dist 目录路径：server/ 的上一级目录中的 dist/
+_DIST_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'dist')
+
+app = Flask(__name__, static_folder=None)  # 禁用默认静态文件路由，手动控制
 CORS(app)
 
 # ==================== 全局市场数据缓存 ====================
@@ -1318,13 +1322,83 @@ def em_news_proxy():
         return jsonify({'error': str(e)}), 500
 
 
+# ==================== 东方财富直连代理（打包后替代 Vite proxy） ====================
+# 开发时 Vite proxy 将 /api/eastmoney 代理到 push2delay.eastmoney.com
+# 打包后由 Flask 后端接管此代理，确保前端 _emFetch 主通道正常工作
+
+@app.route('/api/eastmoney/<path:subpath>')
+def em_direct_proxy(subpath):
+    """代理东方财富行情 API（直连模式）
+    前端请求 /api/eastmoney/api/qt/clist/get?...
+    转发到 https://push2delay.eastmoney.com/api/qt/clist/get?...
+    """
+    url = f'https://push2delay.eastmoney.com/{subpath}'
+    params = {k: v for k, v in request.args.items()}
+    try:
+        r = _session.get(url, params=params, timeout=15,
+                         headers={'User-Agent': 'Mozilla/5.0', 'Referer': 'https://quote.eastmoney.com/'})
+        return jsonify(r.json())
+    except Exception as e:
+        print(f"[ERROR] em_direct_proxy: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+# ==================== 天气 API 代理（打包后替代 Vite proxy） ====================
+@app.route('/api/weather/<path:subpath>')
+def weather_proxy(subpath):
+    """代理天气 API
+    前端请求 /api/weather/city/<code>
+    转发到 http://t.weather.itboy.net/api/weather/city/<code>
+    """
+    url = f'http://t.weather.itboy.net/api/weather/{subpath}'
+    params = {k: v for k, v in request.args.items()}
+    try:
+        r = _session.get(url, params=params, timeout=10,
+                         headers={'User-Agent': 'Mozilla/5.0'})
+        return jsonify(r.json())
+    except Exception as e:
+        print(f"[ERROR] weather_proxy: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+# ==================== 静态文件服务（打包后部署） ====================
+# 打包后的 dist 目录由 Flask 提供，访问 http://127.0.0.1:5001/dianayyx2/ 即可
+
+@app.route('/dianayyx2/')
+@app.route('/dianayyx2')
+def serve_index():
+    """返回前端入口 index.html"""
+    index_path = os.path.join(_DIST_DIR, 'index.html')
+    if os.path.exists(index_path):
+        return send_from_directory(_DIST_DIR, 'index.html')
+    return jsonify({'error': '前端未打包，请先运行 pnpm run build'}), 404
+
+
+@app.route('/dianayyx2/<path:filename>')
+def serve_static(filename):
+    """返回前端静态资源（JS/CSS/图片等）"""
+    return send_from_directory(_DIST_DIR, filename)
+
+
+@app.route('/')
+def root_redirect():
+    """根路径重定向到前端入口"""
+    from flask import redirect
+    return redirect('/dianayyx2/')
+
+
 # ==================== 启动 ====================
 if __name__ == '__main__':
+    dist_exists = os.path.exists(os.path.join(_DIST_DIR, 'index.html'))
     print("=" * 60)
     print("  akshare 股票数据 API 服务")
     print(f"  akshare version: {ak.__version__}")
     print("  服务地址: http://127.0.0.1:5001")
     print("  健康检查: http://127.0.0.1:5001/api/akshare/health")
+    if dist_exists:
+        print(f"  前端入口: http://127.0.0.1:5001/dianayyx2/")
+    else:
+        print("  [警告] dist 目录不存在，请先运行 pnpm run build")
     print("  优化: 后台预加载全市场数据，刷新间隔 60s")
     print("=" * 60)
 

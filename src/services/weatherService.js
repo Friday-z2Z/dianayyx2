@@ -143,7 +143,7 @@ export const getCurrentWeather = async (cityName = '杭州') => {
 
   let timeoutId = null
   try {
-    const baseUrl = import.meta.env.DEV ? '/api/weather' : 'http://t.weather.itboy.net/api/weather'
+    const baseUrl = '/api/weather'
     const url = `${baseUrl}/city/${city.code}`
 
     const controller = new AbortController()
