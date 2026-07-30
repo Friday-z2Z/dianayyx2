@@ -16,12 +16,8 @@ jobs:
       # 官方action，将代码拉取到虚拟机
       - name: Checkout  ️ 
         uses: actions/checkout@v4
-      - name: Install pnpm
+      - name: Install pnpm   # 从 package.json 的 packageManager 字段读取版本，避免版本冲突
         uses: pnpm/action-setup@v4
-        with:
-          version: 7
-          run_install: true
-
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
