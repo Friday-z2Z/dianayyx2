@@ -27,10 +27,18 @@ jobs:
       - name: Install and Build   # 安装依赖、打包
         env:
           # 部署模式说明：
-          # 1. 静态模式（默认）：不设置 VITE_API_BASE secret，前端直连东方财富 API + Open-Meteo 天气 API
-          #    适用于无需后端的纯静态部署，推送代码即自动构建部署
-          # 2. 完整模式：设置 VITE_API_BASE secret 为远程后端地址（如 https://your-server.com）
-          #    启用全部功能（融资数据、IPO日历、财经新闻等需后端支持）
+          # 1. 静态模式（默认）：不设置 VITE_API_BASE secret
+          #    - 直连东方财富 API + Open-Meteo 天气 API
+          #    - 内置 3 个公共 CORS 代理容错（直连失败自动切换）
+          #    - 推送代码即自动部署，无需额外配置
+          #
+          # 2. Worker 代理模式（推荐，解决 ERR_CONNECTION_CLOSED）：
+          #    - 部署 cloudflare-worker/cors-proxy.js 到 Cloudflare Workers（免费）
+          #    - 设置 VITE_API_BASE = https://your-worker.workers.dev
+          #    - 所有 API 请求通过 Cloudflare 代理，稳定可靠
+          #
+          # 3. 完整模式：设置 VITE_API_BASE 为远程 Flask 后端地址
+          #    - 启用全部功能（融资数据、IPO日历、财经新闻等）
           VITE_API_BASE: ${{ secrets.VITE_API_BASE }}
         run: |
           pnpm install

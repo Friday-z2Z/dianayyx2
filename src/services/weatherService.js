@@ -154,6 +154,7 @@ const getWindDir = (deg) => {
 
 /**
  * 从 Open-Meteo 获取天气（静态模式专用，支持 CORS + HTTPS）
+ * 直连失败时通过 CORS 代理降级
  */
 const getWeatherFromOpenMeteo = async (cityName) => {
   const coords = CITY_COORDS[cityName] || CITY_COORDS['杭州']
@@ -163,14 +164,37 @@ const getWeatherFromOpenMeteo = async (cityName) => {
     `&daily=temperature_2m_max,temperature_2m_min` +
     `&timezone=Asia/Shanghai`
 
-  const controller = new AbortController()
-  const timeoutId = setTimeout(() => controller.abort(), 15000)
+  // 尝试直连，失败则通过 CORS 代理
+  const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`
+  let json = null
+
+  // 1. 直连
   try {
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(), 15000)
     const response = await fetch(url, { signal: controller.signal })
     clearTimeout(timeoutId)
-    if (!response.ok) throw new Error(`Open-Meteo HTTP ${response.status}`)
-    const json = await response.json()
+    if (response.ok) json = await response.json()
+  } catch (e) {
+    console.warn('[WeatherService] Open-Meteo 直连失败，尝试代理:', e.message)
+  }
 
+  // 2. CORS 代理降级
+  if (!json) {
+    try {
+      const controller = new AbortController()
+      const timeoutId = setTimeout(() => controller.abort(), 20000)
+      const response = await fetch(proxyUrl, { signal: controller.signal })
+      clearTimeout(timeoutId)
+      if (response.ok) json = await response.json()
+    } catch (e) {
+      console.warn('[WeatherService] Open-Meteo 代理也失败:', e.message)
+    }
+  }
+
+  if (!json) return getFallbackWeather(cityName)
+
+  try {
     const cw = json.current_weather
     const wmo = WMO_CODE_MAP[cw.weathercode] || { desc: '未知', icon: '🌤️', bg: 'partly-cloudy' }
 
@@ -205,8 +229,7 @@ const getWeatherFromOpenMeteo = async (cityName) => {
       notice: isDay ? '注意防晒补水' : '夜间温差较大',
     }
   } catch (error) {
-    clearTimeout(timeoutId)
-    console.warn('[WeatherService] Open-Meteo 请求失败:', error.message)
+    console.warn('[WeatherService] Open-Meteo 数据解析失败:', error.message)
     return getFallbackWeather(cityName)
   }
 }

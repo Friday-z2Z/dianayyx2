@@ -27,6 +27,106 @@ const EM_DIRECT = IS_STATIC ? 'https://push2delay.eastmoney.com' : `${API_BASE}/
 const EM_BACKEND = IS_STATIC ? '' : `${API_BASE}/api/akshare/em_api`
 const EM_UT = 'bd1d9ddb04089700cf9c27f6f7426281'
 
+// ==================== 静态模式 CORS 代理容错 ====================
+// GitHub Pages (HTTPS) 直连东方财富 API 可能因网络环境被关闭连接
+// 公共 CORS 代理作为降级方案，按顺序尝试直到成功
+const CORS_PROXIES = [
+  { name: 'allorigins', build: (url) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}` },
+  { name: 'codetabs',   build: (url) => `https://api.codetabs.com/v1/proxy/?quest=${url}` },
+  { name: 'corsproxy',  build: (url) => `https://corsproxy.io/?url=${encodeURIComponent(url)}` },
+]
+
+// 缓存可用代理（-1 = 直连，0+ = CORS_PROXIES 索引），避免每次都尝试全部
+let _workingProxyIdx = null  // null = 未测试，-1 = 直连可用，0+ = 代理索引
+
+/**
+ * 带容错的 fetch：静态模式下先直连，失败则依次尝试 CORS 代理
+ * 非静态模式直接请求（由 Vite/Flask 代理）
+ */
+const _fetchWithFallback = async (targetUrl, timeout = 10000) => {
+  // 非静态模式：直接请求
+  if (!IS_STATIC) {
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(), timeout)
+    try {
+      const response = await fetch(targetUrl, { signal: controller.signal, headers: { 'Accept': 'application/json' } })
+      clearTimeout(timeoutId)
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+      return await response.json()
+    } catch (e) {
+      clearTimeout(timeoutId)
+      throw e
+    }
+  }
+
+  // 静态模式：已知可用方式直接使用
+  if (_workingProxyIdx === -1) {
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(), timeout)
+    try {
+      const response = await fetch(targetUrl, { signal: controller.signal, headers: { 'Accept': 'application/json' } })
+      clearTimeout(timeoutId)
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+      return await response.json()
+    } catch (e) {
+      clearTimeout(timeoutId)
+      _workingProxyIdx = null  // 直连失败，重新探测
+    }
+  } else if (_workingProxyIdx >= 0) {
+    const proxy = CORS_PROXIES[_workingProxyIdx]
+    const proxyUrl = proxy.build(targetUrl)
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(), timeout + 5000)
+    try {
+      const response = await fetch(proxyUrl, { signal: controller.signal, headers: { 'Accept': 'application/json' } })
+      clearTimeout(timeoutId)
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+      return await response.json()
+    } catch (e) {
+      clearTimeout(timeoutId)
+      _workingProxyIdx = null  // 代理失败，重新探测
+    }
+  }
+
+  // 探测阶段：先试直连，再试代理
+  // 1. 直连
+  try {
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(), timeout)
+    const response = await fetch(targetUrl, { signal: controller.signal, headers: { 'Accept': 'application/json' } })
+    clearTimeout(timeoutId)
+    if (response.ok) {
+      _workingProxyIdx = -1
+      console.log('[StockService] 静态模式：直连东方财富 API 成功')
+      return await response.json()
+    }
+  } catch (e) {
+    console.warn('[StockService] 直连失败，尝试 CORS 代理:', e.message)
+  }
+
+  // 2. 依次尝试 CORS 代理
+  for (let i = 0; i < CORS_PROXIES.length; i++) {
+    const proxy = CORS_PROXIES[i]
+    const proxyUrl = proxy.build(targetUrl)
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(), timeout + 5000)
+    try {
+      const response = await fetch(proxyUrl, { signal: controller.signal, headers: { 'Accept': 'application/json' } })
+      clearTimeout(timeoutId)
+      if (response.ok) {
+        _workingProxyIdx = i
+        console.log(`[StockService] 静态模式：CORS 代理 ${proxy.name} 可用`)
+        return await response.json()
+      }
+    } catch (e) {
+      clearTimeout(timeoutId)
+      console.warn(`[StockService] CORS 代理 ${proxy.name} 失败:`, e.message)
+    }
+  }
+
+  throw new Error('所有数据源均不可用（直连 + 3 个 CORS 代理）')
+}
+
 /**
  * 通用东方财富 API 请求（双通道容错）
  * 优先 Vite 直连代理，失败降级到后端代理
@@ -34,6 +134,13 @@ const EM_UT = 'bd1d9ddb04089700cf9c27f6f7426281'
 const _emFetch = async (apiPath, apiName, params, timeout = 10000) => {
   const qs = new URLSearchParams(params).toString()
   const directUrl = `${EM_DIRECT}${apiPath}?${qs}`
+
+  // 静态模式：使用带 CORS 代理容错的 fetch
+  if (IS_STATIC) {
+    return _fetchWithFallback(directUrl, timeout)
+  }
+
+  // 开发/部署模式：直连 + 后端代理降级
   const controller = new AbortController()
   const timeoutId = setTimeout(() => controller.abort(), timeout)
   try {
@@ -46,8 +153,6 @@ const _emFetch = async (apiPath, apiName, params, timeout = 10000) => {
     return await response.json()
   } catch (error) {
     clearTimeout(timeoutId)
-    // 静态模式无后端代理，直接抛出错误
-    if (IS_STATIC) throw error
     // 降级：后端代理
     const backendUrl = `${EM_BACKEND}?${new URLSearchParams({ ...params, _api: apiName }).toString()}`
     const controller2 = new AbortController()
