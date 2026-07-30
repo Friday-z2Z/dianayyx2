@@ -29,7 +29,11 @@ jobs:
           node-version: 24
           cache: pnpm
 
-      - name: Install and Build   # 安装依赖、打包，如果提前已打包好无需这一步
+      - name: Install and Build   # 安装依赖、打包，注入远程 API 地址
+        env:
+          # GitHub Pages 部署时，API 请求需指向远程 Flask 后端
+          # 修改为你的服务器地址，如 https://api.example.com
+          VITE_API_BASE: ${{ secrets.VITE_API_BASE }}
         run: |
           pnpm install
           pnpm run build

@@ -5,6 +5,11 @@
  * 不再使用预设股票池，所有数据均来自实时接口
  */
 
+// ==================== API 基地址配置 ====================
+// 开发模式 / 本地 Flask 部署：使用相对路径（Vite proxy 或 Flask 代理）
+// GitHub Pages 部署：通过 VITE_API_BASE 环境变量指向远程后端
+const API_BASE = import.meta.env.VITE_API_BASE || ''
+
 // ==================== 状态管理 ====================
 let _cachedStockData = null
 let _cachedMarketStats = null
@@ -12,10 +17,9 @@ let _cachedMarketStatsTime = 0
 const MARKET_STATS_TTL = 30000  // 市场统计缓存 30 秒
 
 // ==================== 东方财富 API 基础配置 ====================
-// 双通道：Vite 直连代理（主）+ 后端代理（备）
-// Vite 代理直连 push2delay.eastmoney.com，后端代理也已修复系统代理问题
-const EM_DIRECT = '/api/eastmoney'
-const EM_BACKEND = '/api/akshare/em_api'
+// 双通道：直连代理（主）+ 后端代理（备）
+const EM_DIRECT = `${API_BASE}/api/eastmoney`
+const EM_BACKEND = `${API_BASE}/api/akshare/em_api`
 const EM_UT = 'bd1d9ddb04089700cf9c27f6f7426281'
 
 /**
@@ -265,7 +269,7 @@ const checkAkshareAvailable = async () => {
     try {
       const controller = new AbortController()
       const timeoutId = setTimeout(() => controller.abort(), 5000)
-      const response = await fetch('/api/akshare/health', {
+      const response = await fetch(`${API_BASE}/api/akshare/health`, {
         signal: controller.signal,
         headers: { 'Accept': 'application/json' }
       })
@@ -294,7 +298,7 @@ export const resetAkshareCheck = () => {
 }
 
 const fetchFromAkshare = async (endpoint, timeout = 20000) => {
-  const url = `/api/akshare${endpoint}`
+  const url = `${API_BASE}/api/akshare${endpoint}`
   const controller = new AbortController()
   const timeoutId = setTimeout(() => controller.abort(), timeout)
   try {
@@ -723,7 +727,7 @@ export const getNorthboundRanking = async () => {
  * 后端 /api/akshare/em_news 已格式化返回标准新闻结构
  */
 const fetchNewsFromEastMoney = async () => {
-  const url = '/api/akshare/em_news'
+  const url = `${API_BASE}/api/akshare/em_news`
   const controller = new AbortController()
   const timeoutId = setTimeout(() => controller.abort(), 10000)
   try {

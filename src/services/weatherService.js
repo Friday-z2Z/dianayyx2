@@ -4,6 +4,9 @@
  * 仅展示当天天气，自动获取定位城市（失败则默认杭州）
  */
 
+// API 基地址：开发/本地用相对路径，GitHub Pages 用远程后端
+const API_BASE = import.meta.env.VITE_API_BASE || ''
+
 // 中国主要城市代码
 const CITIES = {
   '杭州': { code: '101210101', name: '杭州' },
@@ -143,7 +146,7 @@ export const getCurrentWeather = async (cityName = '杭州') => {
 
   let timeoutId = null
   try {
-    const baseUrl = '/api/weather'
+    const baseUrl = `${API_BASE}/api/weather`
     const url = `${baseUrl}/city/${city.code}`
 
     const controller = new AbortController()
