@@ -13,8 +13,9 @@ export default defineConfig({
         rewrite: (path) => path.replace(/^\/api\/weather/, '/api/weather'),
       },
       '/api/eastmoney': {
-        target: 'https://push2.eastmoney.com',
+        target: 'https://push2delay.eastmoney.com',
         changeOrigin: true,
+        secure: false,
         rewrite: (path) => path.replace(/^\/api\/eastmoney/, ''),
       },
       '/api/akshare': {

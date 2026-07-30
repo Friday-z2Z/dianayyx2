@@ -134,7 +134,6 @@ onMounted(() => {
   <div class="sg-card">
     <!-- 标题栏 -->
     <div class="sg-header">
-      <span class="sg-badge">3</span>
       <span class="sg-title">情绪运行阶段</span>
     </div>
 
@@ -232,20 +231,6 @@ onMounted(() => {
   align-items: center;
   gap: 8px;
   margin-bottom: 8px;
-}
-.sg-badge {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 18px;
-  height: 18px;
-  border-radius: var(--radius-xs);
-  background: var(--color-accent);
-  color: #fff;
-  font-size: 11px;
-  font-weight: 700;
-  font-family: var(--font-mono);
-  flex-shrink: 0;
 }
 .sg-title {
   font-size: 14px;

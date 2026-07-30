@@ -125,7 +125,6 @@ onUnmounted(() => {
   <div class="me-card">
     <!-- 标题栏 -->
     <div class="me-header">
-      <span class="me-badge">2</span>
       <span class="me-title">盘型/环境</span>
     </div>
 
@@ -234,20 +233,6 @@ onUnmounted(() => {
   align-items: center;
   gap: 8px;
   margin-bottom: 12px;
-}
-.me-badge {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 18px;
-  height: 18px;
-  border-radius: var(--radius-xs);
-  background: var(--color-accent);
-  color: #fff;
-  font-size: 11px;
-  font-weight: 700;
-  font-family: var(--font-mono);
-  flex-shrink: 0;
 }
 .me-title {
   font-size: 14px;

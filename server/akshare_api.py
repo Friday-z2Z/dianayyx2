@@ -18,12 +18,35 @@ if sys.platform == 'win32':
     sys.stdout.reconfigure(encoding='utf-8')
     sys.stderr.reconfigure(encoding='utf-8')
 
+# 清除系统代理设置，避免 akshare/requests 通过代理连接失败
+# Windows 系统代理（如 Clash/V2Ray）会导致 akshare 的 requests 请求出现 RemoteDisconnected
+for _proxy_key in ('HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'ALL_PROXY', 'all_proxy'):
+    os.environ.pop(_proxy_key, None)
+os.environ['NO_PROXY'] = '*'
+
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
+import requests as _requests
 import akshare as ak
 import pandas as pd
 import numpy as np
+
+# ==================== 关键：绕过 Windows 系统代理 ====================
+# Windows 系统代理（Clash/V2Ray 127.0.0.1:7897）会导致所有 HTTP 请求被拦截
+# requests 库默认从环境变量和 Windows 注册表读取代理设置
+# trust_env=False 可完全禁止读取代理配置，确保直连目标服务器
+_original_session_init = _requests.Session.__init__
+def _no_proxy_session_init(self, *args, **kwargs):
+    _original_session_init(self, *args, **kwargs)
+    self.trust_env = False
+    self.proxies = {'http': None, 'https': None}
+_requests.Session.__init__ = _no_proxy_session_init
+
+# 全局无代理 Session，用于所有直接 HTTP 调用
+_session = _requests.Session()
+_session.trust_env = False
+_session.proxies = {'http': None, 'https': None}
 
 app = Flask(__name__)
 CORS(app)
@@ -42,6 +65,55 @@ _slow_cache = {}           # {key: (data, timestamp)}
 _slow_cache_lock = threading.Lock()
 _SLOW_CACHE_TTL = 600      # 慢速接口缓存 TTL（秒）
 
+def _fetch_market_data_from_em_direct():
+    """直接从东方财富 push2delay API 获取全市场行情
+    当 akshare 的 82.push2.eastmoney.com 被系统代理阻断时的降级方案。
+    push2delay 每页最多返回 100 条，需要分页获取全部 5885 只股票。
+    返回与 ak.stock_zh_a_spot_em() 相同列名的 DataFrame。
+    """
+    all_items = []
+    page = 1
+    max_pages = 80  # 5885 / 100 ≈ 59 页，留余量
+    while page <= max_pages:
+        url = 'https://push2delay.eastmoney.com/api/qt/clist/get'
+        params = {
+            'pn': str(page), 'pz': '100', 'po': '1', 'np': '1',
+            'ut': 'bd1d9ddb04089700cf9c27f6f7426281',
+            'fltt': '2', 'invt': '2', 'fid': 'f12',
+            'fs': 'm:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23,m:0 t:81 s:2048',
+            'fields': 'f2,f3,f4,f5,f6,f7,f8,f9,f12,f14,f15,f16,f17,f18,f20,f23',
+        }
+        r = _session.get(url, params=params, timeout=30,
+                          headers={'User-Agent': 'Mozilla/5.0', 'Referer': 'https://quote.eastmoney.com/'})
+        data = r.json()
+        items = data.get('data', {}).get('diff', [])
+        if not items:
+            break
+        all_items.extend(items)
+        if len(items) < 100:
+            break
+        page += 1
+
+    # 转换为与 akshare 相同列名的 DataFrame
+    col_map = {
+        'f2': '最新价', 'f3': '涨跌幅', 'f4': '涨跌额', 'f5': '成交量',
+        'f6': '成交额', 'f7': '振幅', 'f8': '换手率', 'f9': '市盈率-动态',
+        'f12': '代码', 'f14': '名称', 'f15': '最高', 'f16': '最低',
+        'f17': '今开', 'f18': '昨收', 'f20': '总市值', 'f23': '市净率',
+    }
+    rows = []
+    for item in all_items:
+        row = {}
+        for f, col in col_map.items():
+            row[col] = item.get(f)
+        rows.append(row)
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df['代码'] = df['代码'].astype(str).str.zfill(6)
+    print(f"[push2delay] 获取 {len(df)} 只股票 ({page-1} 页)")
+    return df
+
+
 def _refresh_market_data():
     """后台刷新全市场行情数据"""
     global _market_df, _market_df_loading, _market_df_last_update
@@ -53,7 +125,13 @@ def _refresh_market_data():
     try:
         print(f"[{datetime.now().strftime('%H:%M:%S')}] 开始刷新全市场行情...")
         t0 = time.time()
-        df = ak.stock_zh_a_spot_em()
+        try:
+            df = ak.stock_zh_a_spot_em()
+        except Exception as e_ak:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] akshare 获取失败({e_ak}), 降级到 push2delay 直连...")
+            df = None
+        if df is None or df.empty:
+            df = _fetch_market_data_from_em_direct()
         elapsed = time.time() - t0
         if df is not None and not df.empty:
             df['代码'] = df['代码'].astype(str).str.zfill(6)
@@ -167,141 +245,48 @@ def format_volume(vol):
 
 def format_money(num):
     n = safe_float(num)
-    if n >= 1e8:
+    abs_n = abs(n)
+    if abs_n >= 1e8:
         return f"{n / 1e8:.2f}亿"
-    if n >= 1e4:
+    if abs_n >= 1e4:
         return f"{n / 1e4:.0f}万"
     return f"{n:.0f}"
 
 def format_market_cap(num):
     n = safe_float(num)
-    if n >= 1e12:
+    abs_n = abs(n)
+    if abs_n >= 1e12:
         return f"{n / 1e12:.2f}万亿"
-    if n >= 1e8:
+    if abs_n >= 1e8:
         return f"{n / 1e8:.1f}亿"
     return f"{n:.0f}万"
 
 
-# ==================== 股票池定义 ====================
-STOCK_POOL = [
-    {'code': '600519', 'name': '贵州茅台', 'industry': '白酒', 'sector': '消费'},
-    {'code': '000858', 'name': '五粮液', 'industry': '白酒', 'sector': '消费'},
-    {'code': '000568', 'name': '泸州老窖', 'industry': '白酒', 'sector': '消费'},
-    {'code': '002304', 'name': '洋河股份', 'industry': '白酒', 'sector': '消费'},
-    {'code': '600809', 'name': '山西汾酒', 'industry': '白酒', 'sector': '消费'},
-    {'code': '600036', 'name': '招商银行', 'industry': '银行', 'sector': '金融'},
-    {'code': '601398', 'name': '工商银行', 'industry': '银行', 'sector': '金融'},
-    {'code': '601939', 'name': '建设银行', 'industry': '银行', 'sector': '金融'},
-    {'code': '601288', 'name': '农业银行', 'industry': '银行', 'sector': '金融'},
-    {'code': '000001', 'name': '平安银行', 'industry': '银行', 'sector': '金融'},
-    {'code': '601166', 'name': '兴业银行', 'industry': '银行', 'sector': '金融'},
-    {'code': '600000', 'name': '浦发银行', 'industry': '银行', 'sector': '金融'},
-    {'code': '600016', 'name': '民生银行', 'industry': '银行', 'sector': '金融'},
-    {'code': '601318', 'name': '中国平安', 'industry': '保险', 'sector': '金融'},
-    {'code': '601628', 'name': '中国人寿', 'industry': '保险', 'sector': '金融'},
-    {'code': '600030', 'name': '中信证券', 'industry': '证券', 'sector': '金融'},
-    {'code': '300059', 'name': '东方财富', 'industry': '金融科技', 'sector': '金融'},
-    {'code': '601688', 'name': '华泰证券', 'industry': '证券', 'sector': '金融'},
-    {'code': '300750', 'name': '宁德时代', 'industry': '新能源', 'sector': '科技'},
-    {'code': '002594', 'name': '比亚迪', 'industry': '新能源汽车', 'sector': '科技'},
-    {'code': '601012', 'name': '隆基绿能', 'industry': '光伏', 'sector': '科技'},
-    {'code': '300274', 'name': '阳光电源', 'industry': '光伏', 'sector': '科技'},
-    {'code': '002459', 'name': '晶澳科技', 'industry': '光伏', 'sector': '科技'},
-    {'code': '688599', 'name': '天合光能', 'industry': '光伏', 'sector': '科技'},
-    {'code': '688981', 'name': '中芯国际', 'industry': '半导体', 'sector': '科技'},
-    {'code': '002371', 'name': '北方华创', 'industry': '半导体设备', 'sector': '科技'},
-    {'code': '603501', 'name': '韦尔股份', 'industry': '芯片设计', 'sector': '科技'},
-    {'code': '688008', 'name': '澜起科技', 'industry': '芯片设计', 'sector': '科技'},
-    {'code': '002475', 'name': '立讯精密', 'industry': '消费电子', 'sector': '科技'},
-    {'code': '000725', 'name': '京东方A', 'industry': '面板', 'sector': '科技'},
-    {'code': '002415', 'name': '海康威视', 'industry': '安防', 'sector': '科技'},
-    {'code': '002241', 'name': '歌尔股份', 'industry': '消费电子', 'sector': '科技'},
-    {'code': '603986', 'name': '兆易创新', 'industry': '存储芯片', 'sector': '科技'},
-    {'code': '002230', 'name': '科大讯飞', 'industry': '人工智能', 'sector': '科技'},
-    {'code': '300496', 'name': '中科创达', 'industry': '智能OS', 'sector': '科技'},
-    {'code': '688111', 'name': '金山办公', 'industry': '软件', 'sector': '科技'},
-    {'code': '300033', 'name': '同花顺', 'industry': '金融科技', 'sector': '科技'},
-    {'code': '000333', 'name': '美的集团', 'industry': '家电', 'sector': '消费'},
-    {'code': '000651', 'name': '格力电器', 'industry': '家电', 'sector': '消费'},
-    {'code': '600690', 'name': '海尔智家', 'industry': '家电', 'sector': '消费'},
-    {'code': '600276', 'name': '恒瑞医药', 'industry': '创新药', 'sector': '医药'},
-    {'code': '300760', 'name': '迈瑞医疗', 'industry': '医疗器械', 'sector': '医药'},
-    {'code': '000538', 'name': '云南白药', 'industry': '中药', 'sector': '医药'},
-    {'code': '300122', 'name': '智飞生物', 'industry': '疫苗', 'sector': '医药'},
-    {'code': '002007', 'name': '华兰生物', 'industry': '血液制品', 'sector': '医药'},
-    {'code': '300347', 'name': '泰格医药', 'industry': 'CRO', 'sector': '医药'},
-    {'code': '600887', 'name': '伊利股份', 'industry': '乳业', 'sector': '消费'},
-    {'code': '603288', 'name': '海天味业', 'industry': '调味品', 'sector': '消费'},
-    {'code': '002714', 'name': '牧原股份', 'industry': '养殖', 'sector': '消费'},
-    {'code': '000002', 'name': '万科A', 'industry': '房地产', 'sector': '地产'},
-    {'code': '600048', 'name': '保利发展', 'industry': '房地产', 'sector': '地产'},
-    {'code': '001979', 'name': '招商蛇口', 'industry': '房地产', 'sector': '地产'},
-    {'code': '600900', 'name': '长江电力', 'industry': '电力', 'sector': '公用'},
-    {'code': '600023', 'name': '浙能电力', 'industry': '电力', 'sector': '公用'},
-    {'code': '600025', 'name': '华能水电', 'industry': '电力', 'sector': '公用'},
-    {'code': '600050', 'name': '中国联通', 'industry': '通信', 'sector': '通信'},
-    {'code': '601728', 'name': '中国电信', 'industry': '通信', 'sector': '通信'},
-    {'code': '000063', 'name': '中兴通讯', 'industry': '通信设备', 'sector': '通信'},
-    {'code': '600585', 'name': '海螺水泥', 'industry': '水泥', 'sector': '周期'},
-    {'code': '601633', 'name': '长城汽车', 'industry': '汽车', 'sector': '周期'},
-    {'code': '600104', 'name': '上汽集团', 'industry': '汽车', 'sector': '周期'},
-    {'code': '601857', 'name': '中国石油', 'industry': '石油', 'sector': '周期'},
-    {'code': '600028', 'name': '中国石化', 'industry': '石油', 'sector': '周期'},
-    {'code': '601899', 'name': '紫金矿业', 'industry': '有色金属', 'sector': '周期'},
-    {'code': '603993', 'name': '洛阳钼业', 'industry': '有色金属', 'sector': '周期'},
-    {'code': '601888', 'name': '中国中免', 'industry': '免税', 'sector': '消费'},
-    {'code': '000888', 'name': '峨眉山A', 'industry': '旅游', 'sector': '消费'},
-    {'code': '600893', 'name': '航发动力', 'industry': '航空发动机', 'sector': '军工'},
-    {'code': '002179', 'name': '中航光电', 'industry': '军工电子', 'sector': '军工'},
-    {'code': '600760', 'name': '中航沈飞', 'industry': '军机', 'sector': '军工'},
-    {'code': '601006', 'name': '大秦铁路', 'industry': '铁路', 'sector': '交通'},
-    {'code': '600029', 'name': '南方航空', 'industry': '航空', 'sector': '交通'},
-    {'code': '601111', 'name': '中国国航', 'industry': '航空', 'sector': '交通'},
-    {'code': '300413', 'name': '芒果超媒', 'industry': '流媒体', 'sector': '传媒'},
-    {'code': '002602', 'name': '世纪华通', 'industry': '游戏', 'sector': '传媒'},
-    {'code': '002311', 'name': '海大集团', 'industry': '饲料', 'sector': '农业'},
-    {'code': '300498', 'name': '温氏股份', 'industry': '养殖', 'sector': '农业'},
-    {'code': '601390', 'name': '中国中铁', 'industry': '基建', 'sector': '基建'},
-    {'code': '601186', 'name': '中国铁建', 'industry': '基建', 'sector': '基建'},
-    {'code': '601668', 'name': '中国建筑', 'industry': '基建', 'sector': '基建'},
-    {'code': '002352', 'name': '顺丰控股', 'industry': '快递', 'sector': '物流'},
-    {'code': '600233', 'name': '圆通速递', 'industry': '快递', 'sector': '物流'},
-    {'code': '688036', 'name': '传音控股', 'industry': '手机', 'sector': '科技'},
-    {'code': '300782', 'name': '卓胜微', 'industry': '射频芯片', 'sector': '科技'},
-    {'code': '688012', 'name': '中微公司', 'industry': '半导体设备', 'sector': '科技'},
-    {'code': '603160', 'name': '汇顶科技', 'industry': '芯片设计', 'sector': '科技'},
-    {'code': '002049', 'name': '紫光国微', 'industry': '安全芯片', 'sector': '科技'},
-    {'code': '300661', 'name': '圣邦股份', 'industry': '模拟芯片', 'sector': '科技'},
-    {'code': '688396', 'name': '华润微', 'industry': '功率半导体', 'sector': '科技'},
-    {'code': '002557', 'name': '洽洽食品', 'industry': '休闲食品', 'sector': '消费'},
-    {'code': '603369', 'name': '今世缘', 'industry': '白酒', 'sector': '消费'},
-    {'code': '000977', 'name': '浪潮信息', 'industry': '服务器', 'sector': '科技'},
-    {'code': '603019', 'name': '中科曙光', 'industry': '算力', 'sector': '科技'},
-    {'code': '300474', 'name': '景嘉微', 'industry': 'GPU', 'sector': '科技'},
-]
-
-STOCK_POOL_CODES = [s['code'] for s in STOCK_POOL]
-STOCK_POOL_MAP = {s['code']: s for s in STOCK_POOL}
-
 # ==================== 从全市场缓存中提取数据 ====================
 
 def _extract_stock_list():
-    """从全市场缓存中提取股票池行情"""
+    """从全市场缓存中提取股票行情（按总市值降序，最多返回200只）"""
     df = _get_market_df()
     if df is None or df.empty:
         return None
-    pool_df = df[df['代码'].isin(STOCK_POOL_CODES)].copy()
+    full_df = df.copy()
+    # 按总市值降序排列
+    if '总市值' in full_df.columns:
+        full_df['总市值'] = full_df['总市值'].apply(safe_float)
+        full_df = full_df.sort_values('总市值', ascending=False)
     result = []
-    for _, row in pool_df.iterrows():
+    for _, row in full_df.head(200).iterrows():
         code = str(row.get('代码', '')).zfill(6)
-        meta = STOCK_POOL_MAP.get(code, {})
         price = safe_float(row.get('最新价'))
         change_percent = safe_float(row.get('涨跌幅'))
         change = safe_float(row.get('涨跌额'))
         prev_close = price - change if price and change else safe_float(row.get('昨收'))
+        # industry / sector 直接从行情数据中获取（全市场行情通常无此列，则设为 '--'）
+        industry_val = row.get('行业') if '行业' in row else None
+        sector_val = row.get('板块') if '板块' in row else None
         result.append({
             'code': code,
-            'name': str(row.get('名称', meta.get('name', '--'))),
+            'name': str(row.get('名称', '--')),
             'price': f"{price:.2f}" if price else '--',
             'change': f"{change:.2f}" if change else '--',
             'changePercent': f"{change_percent:.2f}" if change_percent else '0.00',
@@ -316,8 +301,8 @@ def _extract_stock_list():
             'prevClose': f"{prev_close:.2f}" if prev_close else '--',
             'marketCap': format_market_cap(row.get('总市值')),
             'pb': f"{safe_float(row.get('市净率')):.2f}" if safe_float(row.get('市净率')) else '--',
-            'industry': meta.get('industry', '--'),
-            'sector': meta.get('sector', '--'),
+            'industry': str(industry_val) if industry_val is not None and str(industry_val) != 'nan' else '--',
+            'sector': str(sector_val) if sector_val is not None and str(sector_val) != 'nan' else '--',
         })
     return result
 
@@ -365,18 +350,17 @@ def _extract_ranking(direction='up', count=100):
     result = []
     for _, row in full_df.head(count).iterrows():
         code = str(row.get('代码', '')).zfill(6)
-        meta = STOCK_POOL_MAP.get(code, {})
         price = safe_float(row.get('最新价'))
         result.append({
             'code': code,
-            'name': str(row.get('名称', meta.get('name', '--'))),
+            'name': str(row.get('名称', '--')),
             'price': f"{price:.2f}" if price else '--',
             'changePercent': f"{safe_float(row.get('涨跌幅')):.2f}",
             'change': f"{safe_float(row.get('涨跌额')):.2f}",
             'volume': format_volume(row.get('成交量')),
             'turnover': format_money(row.get('成交额')),
-            'industry': meta.get('industry', '--'),
-            'sector': meta.get('sector', '--'),
+            'industry': '--',
+            'sector': '--',
         })
     return result
 
@@ -531,8 +515,29 @@ def _fetch_indices_cached():
             _indices_cache_time = time.time()
         return result
     except Exception as e:
-        print(f"[WARN] 指数获取失败: {e}")
-        return {'shIndex': sh_data, 'szIndex': sz_data, 'cyIndex': cy_data}
+        print(f"[WARN] 指数获取失败({e}), 降级到 push2delay 直连...")
+        # 降级：push2delay ulist API
+        try:
+            url = 'https://push2delay.eastmoney.com/api/qt/ulist.np/get'
+            params = {
+                'fltt': '2', 'invt': '2',
+                'fields': 'f2,f3,f4,f6,f12,f14',
+                'secids': '1.000001,0.399001,0.399006',
+            }
+            r = _session.get(url, params=params, timeout=8,
+                             headers={'User-Agent': 'Mozilla/5.0', 'Referer': 'https://quote.eastmoney.com/'})
+            items = r.json().get('data', {}).get('diff', [])
+            if items and len(items) >= 3:
+                sh_data = {'value': f"{safe_float(items[0].get('f2')):.2f}", 'change': f"{safe_float(items[0].get('f3')):.2f}", 'name': items[0].get('f14', '上证指数')}
+                sz_data = {'value': f"{safe_float(items[1].get('f2')):.2f}", 'change': f"{safe_float(items[1].get('f3')):.2f}", 'name': items[1].get('f14', '深证成指')}
+                cy_data = {'value': f"{safe_float(items[2].get('f2')):.2f}", 'change': f"{safe_float(items[2].get('f3')):.2f}", 'name': items[2].get('f14', '创业板指')}
+        except Exception as e2:
+            print(f"[WARN] push2delay 指数获取也失败: {e2}")
+        result = {'shIndex': sh_data, 'szIndex': sz_data, 'cyIndex': cy_data}
+        with _indices_lock:
+            _indices_cache = result
+            _indices_cache_time = time.time()
+        return result
 
 
 @app.route('/api/akshare/northbound')
@@ -609,22 +614,37 @@ def get_northbound():
 @app.route('/api/akshare/ipo')
 @cached('ipo', 3600)
 def get_ipo_calendar():
-    """获取新股日历"""
+    """获取新股日历
+    使用 stock_new_ipo_cninfo() 获取含发行价和发行市盈率的新股数据
+    """
     try:
-        df = ak.stock_ipo_declare_em()
+        df = ak.stock_new_ipo_cninfo()
         if df is None or df.empty:
             raise ValueError("IPO数据为空")
+        # 按申购日期降序排列（最近的在前）
+        if '申购日期' in df.columns:
+            df = df.sort_values('申购日期', ascending=False)
         result = []
-        for _, row in df.head(10).iterrows():
+        for _, row in df.head(15).iterrows():
+            # 上市日期可能为 NaT，需处理
+            list_date = row.get('上市日期')
+            list_date_str = None
+            if list_date is not None and str(list_date) != 'NaT' and str(list_date) != 'nan':
+                list_date_str = str(list_date)[:10]
+
+            # 发行价和市盈率：缺失时返回 None，前端 v-if 不显示
+            price_val = safe_float(row.get('发行价'))
+            pe_val = safe_float(row.get('发行市盈率'))
+
             result.append({
-                'name': str(row.get('企业名称', '--')),
-                'code': '--',
-                'industry': str(row.get('注册地', '--')),
-                'price': '--',
-                'pe': '--',
-                'applyDate': str(row.get('更新日期', '--')),
-                'listDate': str(row.get('拟上市地点', '--')),
-                'status': str(row.get('最新状态', '--')),
+                'name': str(row.get('证券简称', '--')),
+                'code': str(row.get('证劵代码', '--')),
+                'industry': None,
+                'price': round(price_val, 2) if price_val else None,
+                'pe': round(pe_val, 2) if pe_val else None,
+                'applyDate': str(row.get('申购日期', '--'))[:10],
+                'listDate': list_date_str,
+                'status': None,
             })
         return jsonify(result)
     except Exception as e:
@@ -635,20 +655,27 @@ def get_ipo_calendar():
 @app.route('/api/akshare/lockup')
 @cached('lockup', 3600)
 def get_lockup_calendar():
-    """获取解禁日历"""
+    """获取解禁日历
+
+    使用 stock_restricted_release_detail_em 获取含股票名称和代码的解禁明细。
+    返回本月及下月的解禁数据，按解禁市值降序排列。
+    """
     try:
-        df = ak.stock_restricted_release_queue_em()
+        now = datetime.now()
+        start_date = now.strftime('%Y%m%d')
+        end_date = (now.replace(day=1) + timedelta(days=62)).strftime('%Y%m%d')
+        df = ak.stock_restricted_release_detail_em(start_date=start_date, end_date=end_date)
         if df is None or df.empty:
             raise ValueError("解禁数据为空")
         result = []
-        for _, row in df.head(10).iterrows():
+        for _, row in df.head(15).iterrows():
             result.append({
-                'name': str(row.get('股票名称', '--')),
+                'name': str(row.get('股票简称', '--')),
                 'code': str(row.get('股票代码', '--')),
-                'type': str(row.get('解禁类型', '--')),
-                'date': str(row.get('解禁日期', '--')),
-                'volume': safe_float(row.get('解禁数量', 0)),
-                'marketValue': round(safe_float(row.get('解禁市值', 0)) / 1e8, 1),
+                'type': str(row.get('限售股类型', '--')),
+                'date': str(row.get('解禁时间', '--')),
+                'volume': round(safe_float(row.get('实际解禁数量', 0)) / 1e4, 1),
+                'marketValue': round(safe_float(row.get('实际解禁市值', 0)) / 1e8, 1),
             })
         return jsonify(result)
     except Exception as e:
@@ -693,41 +720,38 @@ def get_earnings_calendar():
 
 @app.route('/api/akshare/global_indices')
 def get_global_indices():
-    """获取全球指数"""
+    """获取全球指数
+
+    使用东方财富 push2delay 直连 API，避免 akshare 代理问题。
+    """
     with _slow_cache_lock:
         cached = _slow_cache.get('global_indices')
         if cached and (time.time() - cached[1] < _SLOW_CACHE_TTL):
             return jsonify(cached[0])
 
     try:
-        df = ak.index_global_spot_em()
-        if df is None or df.empty:
+        url = 'https://push2delay.eastmoney.com/api/qt/clist/get'
+        params = {
+            'pn': 1, 'pz': 20, 'po': 1, 'np': 1,
+            'fltt': 2, 'invt': 2, 'fid': 'f3',
+            'fs': 'i:100.HSI,i:100.N225,i:100.DJIA,i:100.SPX,i:100.NDX,i:100.FTSE,i:100.GDAXI,i:100.KS11',
+            'fields': 'f2,f3,f4,f12,f14',
+        }
+        r = _session.get(url, params=params, timeout=15,
+                         headers={'User-Agent': 'Mozilla/5.0'})
+        data = r.json()
+        items = data.get('data', {}).get('diff', []) if data else []
+        if not items:
             raise ValueError("全球指数数据为空")
 
-        target_indices = {
-            'HSI': '恒生指数', 'N225': '日经225', 'DJI': '道琼斯',
-            'SPX': '标普500', 'NDX': '纳斯达克', 'FTSE': '富时100',
-            'GDAXI': '德国DAX', 'KS11': '韩国KOSPI',
-        }
         result = []
-        for _, row in df.iterrows():
-            name = str(row.get('名称', ''))
-            code = str(row.get('代码', ''))
-            for target_code, target_name in target_indices.items():
-                if target_name in name or target_code == code:
-                    result.append({
-                        'code': target_code, 'name': target_name,
-                        'value': f"{safe_float(row.get('最新价')):.2f}",
-                        'changePercent': f"{safe_float(row.get('涨跌幅')):.2f}",
-                    })
-                    break
-        if not result:
-            for _, row in df.head(8).iterrows():
-                result.append({
-                    'code': str(row.get('代码', '--')), 'name': str(row.get('名称', '--')),
-                    'value': f"{safe_float(row.get('最新价')):.2f}",
-                    'changePercent': f"{safe_float(row.get('涨跌幅')):.2f}",
-                })
+        for item in items:
+            result.append({
+                'code': str(item.get('f12', '--')),
+                'name': str(item.get('f14', '--')),
+                'value': f"{safe_float(item.get('f2')):.2f}",
+                'changePercent': f"{safe_float(item.get('f3')):.2f}",
+            })
         result = result[:8]
         with _slow_cache_lock:
             _slow_cache['global_indices'] = (result, time.time())
@@ -804,31 +828,69 @@ def get_sector_heatmap():
     """获取板块热力图数据
 
     返回涨幅前15 + 跌幅前15 = 30个板块，适合移动端热力图展示。
+    优先使用 akshare，降级到 push2delay 直连。
     """
+    # 优先 akshare
     try:
         df = ak.stock_board_industry_name_em()
-        if df is None or df.empty:
-            raise ValueError("板块数据为空")
+        if df is not None and not df.empty:
+            result = []
+            for _, row in df.iterrows():
+                up = int(safe_float(row.get('上涨家数', 0)))
+                down = int(safe_float(row.get('下跌家数', 0)))
+                result.append({
+                    'name': str(row.get('板块名称', '--')),
+                    'avgChange': f"{safe_float(row.get('涨跌幅')):.2f}",
+                    'upCount': up,
+                    'downCount': down,
+                    'count': up + down,
+                    'totalVolume': format_money(row.get('总市值')),
+                    'topStock': str(row.get('领涨股票', '--')),
+                    'topStockChange': f"{safe_float(row.get('领涨股票-涨跌幅')):.2f}",
+                })
+            result.sort(key=lambda x: safe_float(x['avgChange'], -999), reverse=True)
+            top_gainers = result[:15]
+            top_losers = result[-15:]
+            seen = set()
+            merged = []
+            for s in top_gainers + top_losers:
+                if s['name'] not in seen:
+                    seen.add(s['name'])
+                    merged.append(s)
+            return jsonify(merged)
+    except Exception as e:
+        print(f"[WARN] akshare 板块热力图失败({e}), 降级到 push2delay 直连...")
+
+    # 降级：push2delay 直连（行业板块行情）
+    try:
+        url = 'https://push2delay.eastmoney.com/api/qt/clist/get'
+        params = {
+            'pn': '1', 'pz': '100', 'po': '1', 'np': '1',
+            'ut': 'bd1d9ddb04089700cf9c27f6f7426281',
+            'fltt': '2', 'invt': '2', 'fid': 'f3',
+            'fs': 'm:90 t:2 f:!50',
+            'fields': 'f2,f3,f4,f8,f12,f14,f104,f105,f128,f136,f140,f168',
+        }
+        r = _session.get(url, params=params, timeout=15,
+                         headers={'User-Agent': 'Mozilla/5.0', 'Referer': 'https://quote.eastmoney.com/'})
+        items = r.json().get('data', {}).get('diff', [])
         result = []
-        for _, row in df.iterrows():
-            up = int(safe_float(row.get('上涨家数', 0)))
-            down = int(safe_float(row.get('下跌家数', 0)))
+        for item in items:
+            up = int(safe_float(item.get('f104', 0)))
+            down = int(safe_float(item.get('f105', 0)))
             result.append({
-                'name': str(row.get('板块名称', '--')),
-                'avgChange': f"{safe_float(row.get('涨跌幅')):.2f}",
+                'name': item.get('f14', '--'),
+                'avgChange': f"{safe_float(item.get('f3')):.2f}",
                 'upCount': up,
                 'downCount': down,
                 'count': up + down,
-                'totalVolume': format_money(row.get('总市值')),
-                'topStock': str(row.get('领涨股票', '--')),
-                'topStockChange': f"{safe_float(row.get('领涨股票-涨跌幅')):.2f}",
+                'totalVolume': format_money(item.get('f168')),
+                'topStock': str(item.get('f128', '--')),
+                'topStockChange': f"{safe_float(item.get('f136')):.2f}",
             })
-        # 按涨跌幅排序
         result.sort(key=lambda x: safe_float(x['avgChange'], -999), reverse=True)
-        # 取涨幅前15 + 跌幅前15
         top_gainers = result[:15]
         top_losers = result[-15:]
-        # 合并去重
         seen = set()
         merged = []
         for s in top_gainers + top_losers:
@@ -837,7 +899,7 @@ def get_sector_heatmap():
                 merged.append(s)
         return jsonify(merged)
     except Exception as e:
-        print(f"[ERROR] get_sector_heatmap: {e}")
+        print(f"[ERROR] get_sector_heatmap fallback: {e}")
         return jsonify({'error': str(e)}), 500
 
 
@@ -913,12 +975,14 @@ def get_stock_detail(code):
             stock_row = df[df['代码'] == code]
             if not stock_row.empty:
                 row = stock_row.iloc[0]
-                meta = STOCK_POOL_MAP.get(code, {})
                 price = safe_float(row.get('最新价'))
                 change = safe_float(row.get('涨跌额'))
+                # industry / sector 直接从行情数据中获取（全市场行情通常无此列，则设为 '--'）
+                industry_val = row.get('行业') if '行业' in row else None
+                sector_val = row.get('板块') if '板块' in row else None
                 stock_info = {
                     'code': code,
-                    'name': str(row.get('名称', meta.get('name', '--'))),
+                    'name': str(row.get('名称', '--')),
                     'price': f"{price:.2f}" if price else '--',
                     'change': f"{change:.2f}" if change else '--',
                     'changePercent': f"{safe_float(row.get('涨跌幅')):.2f}",
@@ -933,8 +997,8 @@ def get_stock_detail(code):
                     'marketCap': format_market_cap(row.get('总市值')),
                     'pe': f"{safe_float(row.get('市盈率-动态')):.2f}" if safe_float(row.get('市盈率-动态')) else '--',
                     'pb': f"{safe_float(row.get('市净率')):.2f}" if safe_float(row.get('市净率')) else '--',
-                    'industry': meta.get('industry', '--'),
-                    'sector': meta.get('sector', '--'),
+                    'industry': str(industry_val) if industry_val is not None and str(industry_val) != 'nan' else '--',
+                    'sector': str(sector_val) if sector_val is not None and str(sector_val) != 'nan' else '--',
                 }
 
         # K线数据（单独调用，有缓存）
@@ -989,43 +1053,162 @@ def get_ranking():
 def get_fund_flow_ranking():
     """获取个股资金流向排行（实时）
 
-    使用 ak.stock_individual_fund_flow_rank 获取全市场个股资金流向数据，
+    优先使用 ak.stock_individual_fund_flow_rank，
+    降级到 push2delay 直连 API。
     返回今日主力净流入前20和后20。
+    所有金额字段返回原始数值（元），前端负责格式化显示，确保单位一致。
     """
+    # 优先 akshare
     try:
         indicator = request.args.get('indicator', '今日')
         df = ak.stock_individual_fund_flow_rank(indicator=indicator)
-        if df is None or df.empty:
-            raise ValueError("资金流向数据为空")
+        if df is not None and not df.empty:
+            result = []
+            for _, row in df.iterrows():
+                code = str(row.get('代码', '')).zfill(6)
+                main_inflow = safe_float(row.get('今日主力净流入-净额'))
+                result.append({
+                    'code': code,
+                    'name': str(row.get('名称', '--')),
+                    'price': safe_float(row.get('最新价')),
+                    'changePercent': safe_float(row.get('今日涨跌幅')),
+                    'mainNetInflow': main_inflow,
+                    'mainNetInflowPct': safe_float(row.get('今日主力净流入-净占比')),
+                    'superLargeNetInflow': safe_float(row.get('今日超大单净流入-净额')),
+                    'largeNetInflow': safe_float(row.get('今日大单净流入-净额')),
+                    'mediumNetInflow': safe_float(row.get('今日中单净流入-净额')),
+                    'smallNetInflow': safe_float(row.get('今日小单净流入-净额')),
+                })
+            # 按主力净流入原始数值降序排列
+            result.sort(key=lambda x: x['mainNetInflow'], reverse=True)
+            inflow = result[:20]
+            # 流出按原始数值升序（最负的在前）
+            outflow = list(reversed(result[-20:]))
+            return jsonify({'inflow': inflow, 'outflow': outflow})
+    except Exception as e:
+        print(f"[WARN] akshare 资金流向失败({e}), 降级到 push2delay 直连...")
 
-        # 确保列名正确
-        result = []
-        for _, row in df.iterrows():
-            code = str(row.get('代码', '')).zfill(6)
-            net_inflow = safe_float(row.get('今日主力净流入-净额', 0))
-            result.append({
-                'code': code,
-                'name': str(row.get('名称', '--')),
-                'price': f"{safe_float(row.get('最新价')):.2f}",
-                'changePercent': f"{safe_float(row.get('今日涨跌幅')):.2f}",
-                'mainNetInflow': format_money(row.get('今日主力净流入-净额')),
-                'mainNetInflowPct': f"{safe_float(row.get('今日主力净流入-净占比')):.2f}",
-                'superLargeNetInflow': format_money(row.get('今日超大单净流入-净额')),
-                'largeNetInflow': format_money(row.get('今日大单净流入-净额')),
-                'mediumNetInflow': format_money(row.get('今日中单净流入-净额')),
-                'smallNetInflow': format_money(row.get('今日小单净流入-净额')),
-            })
+    # 降级：push2delay 直连
+    try:
+        base_url = 'https://push2delay.eastmoney.com/api/qt/clist/get'
+        common_params = {
+            'pn': '1', 'pz': '20', 'np': '1',
+            'ut': 'b2884a393a59ad64002292a3e90d46a5',
+            'fltt': '2', 'invt': '2', 'fid': 'f62',
+            'fs': 'm:0 t:6 f:!2,m:0 t:13 f:!2,m:0 t:80 f:!2,m:1 t:2 f:!2,m:1 t:23 f:!2,m:0 t:7 f:!2,m:1 t:3 f:!2',
+            'fields': 'f12,f14,f2,f3,f62,f184,f66,f72,f78,f84',
+        }
+        headers = {'User-Agent': 'Mozilla/5.0', 'Referer': 'https://quote.eastmoney.com/'}
 
-        # 按主力净流入排序
-        result.sort(key=lambda x: safe_float(x.get('mainNetInflow', '0').replace('亿', '').replace('万', '')), reverse=True)
+        # 流入前20（降序）
+        inflow_params = {**common_params, 'po': '1'}
+        r_in = _session.get(base_url, params=inflow_params, timeout=15, headers=headers)
+        inflow_items = r_in.json().get('data', {}).get('diff', [])
 
-        # 返回流入前20 + 流出前20
-        inflow = result[:20]
-        outflow = sorted(result[-20:], key=lambda x: safe_float(x.get('mainNetInflow', '0').replace('亿', '').replace('万', '')))
+        # 流出前20（升序）
+        outflow_params = {**common_params, 'po': '0'}
+        r_out = _session.get(base_url, params=outflow_params, timeout=15, headers=headers)
+        outflow_items = r_out.json().get('data', {}).get('diff', [])
+
+        def map_fund(item):
+            return {
+                'code': str(item.get('f12', '')).zfill(6),
+                'name': item.get('f14', '--'),
+                'price': safe_float(item.get('f2')),
+                'changePercent': safe_float(item.get('f3')),
+                'mainNetInflow': safe_float(item.get('f62')),
+                'mainNetInflowPct': safe_float(item.get('f184')),
+                'superLargeNetInflow': safe_float(item.get('f66')),
+                'largeNetInflow': safe_float(item.get('f72')),
+                'mediumNetInflow': safe_float(item.get('f78')),
+                'smallNetInflow': safe_float(item.get('f84')),
+            }
+
+        inflow = [map_fund(item) for item in inflow_items[:20]]
+        outflow = [map_fund(item) for item in outflow_items[:20]]
         return jsonify({'inflow': inflow, 'outflow': outflow})
     except Exception as e:
-        print(f"[ERROR] get_fund_flow_ranking: {e}")
+        print(f"[ERROR] get_fund_flow_ranking fallback: {e}")
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/akshare/financing')
+@cached('financing', 300)
+def get_financing():
+    """获取融资融券数据（上交所为主，附加深交所最新日）
+
+    返回最近20个交易日的融资余额、融资买入额、净买入额及时间序列。
+    所有金额字段返回原始数值（元），前端负责格式化显示。
+    上交所数据为多日历史（单位：元），深交所数据为单日（单位：亿元，需×1e8转换）。
+    """
+    try:
+        end_date = datetime.now().strftime('%Y%m%d')
+        start_date = (datetime.now() - timedelta(days=40)).strftime('%Y%m%d')
+
+        # 1. 获取上交所融资融券数据（多日，单位：元）
+        df = None
+        try:
+            df = ak.stock_margin_sse(start_date=start_date, end_date=end_date)
+        except Exception as e:
+            print(f"[WARN] 获取SSE融资数据失败: {e}")
+
+        if df is None or df.empty:
+            return jsonify({'balance': 0, 'buy': 0, 'repay': 0, 'net': 0, 'timeSharing': []})
+
+        df = df.copy()
+        # SSE 日期列名为 '信用交易日期'，统一为 '日期'
+        if '信用交易日期' in df.columns:
+            df.rename(columns={'信用交易日期': '日期'}, inplace=True)
+        df['日期'] = pd.to_datetime(df['日期'], format='%Y%m%d')
+        df = df.sort_values('日期').tail(20).reset_index(drop=True)
+
+        # 计算融资偿还额：融资余额[t] = 融资余额[t-1] + 融资买入额 - 融资偿还额
+        # 净买入 = 融资余额[t] - 融资余额[t-1]
+        df['净买入'] = df['融资余额'].diff()
+        df['融资偿还额'] = df['融资买入额'] - df['净买入']
+        # 第一行无前一日数据，净买入设为0（无法计算）
+        df.loc[df.index[0], '净买入'] = 0
+        df.loc[df.index[0], '融资偿还额'] = safe_float(df.loc[df.index[0], '融资买入额'])
+
+        # 2. 尝试获取深交所最新日数据（单位：亿元，需×1e8转换为元）
+        latest_date_str = df.iloc[-1]['日期'].strftime('%Y%m%d')
+        szse_balance = 0
+        szse_buy = 0
+        try:
+            df_szse = ak.stock_margin_szse(date=latest_date_str)
+            if df_szse is not None and not df_szse.empty:
+                # SZSE 数据单位为亿元
+                szse_balance = safe_float(df_szse.iloc[0].get('融资余额', 0)) * 1e8
+                szse_buy = safe_float(df_szse.iloc[0].get('融资买入额', 0)) * 1e8
+                print(f"[INFO] SZSE融资数据获取成功: 余额={szse_balance/1e8:.2f}亿, 买入={szse_buy/1e8:.2f}亿")
+        except Exception as e:
+            print(f"[WARN] 获取SZSE融资数据失败: {e}")
+
+        # 3. 汇总最新日数据（SSE + SZSE）
+        latest = df.iloc[-1]
+        total_balance = safe_float(latest['融资余额']) + szse_balance
+        total_buy = safe_float(latest['融资买入额']) + szse_buy
+        # SSE净买入可从余额变化计算，SZSE无历史数据故净买入用SSE值
+        total_net = safe_float(latest['净买入'])
+        total_repay = total_buy - total_net
+
+        return jsonify({
+            'balance': total_balance,
+            'buy': total_buy,
+            'repay': total_repay,
+            'net': total_net,
+            'timeSharing': [
+                {
+                    'date': row['日期'].strftime('%m-%d'),
+                    'balance': safe_float(row['融资余额']),
+                    'net': safe_float(row['净买入']),
+                }
+                for _, row in df.iterrows()
+            ],
+        })
+    except Exception as e:
+        print(f"[ERROR] get_financing: {e}")
+        return jsonify({'balance': 0, 'buy': 0, 'repay': 0, 'net': 0, 'timeSharing': []})
 
 
 @app.route('/api/akshare/news')
@@ -1069,6 +1252,69 @@ def get_news():
                 return jsonify(result)
         except Exception as e2:
             print(f"[ERROR] get_news fallback: {e2}")
+        return jsonify({'error': str(e)}), 500
+
+
+# ==================== 东方财富 API 代理（绕过系统代理 TLS 问题） ====================
+# Node.js (Vite proxy) 无法直连东方财富 API（系统代理导致 socket hang up）
+# 通过 Flask 后端代理，后端已清除代理环境变量，可直连
+
+_EM_ALLOWED_APIS = {
+    'clist': 'https://push2delay.eastmoney.com/api/qt/clist/get',
+    'ulist': 'https://push2delay.eastmoney.com/api/qt/ulist.np/get',
+}
+
+@app.route('/api/akshare/em_api')
+def em_api_proxy():
+    """代理东方财富行情 API 请求"""
+    api = request.args.get('_api', '')
+    if api not in _EM_ALLOWED_APIS:
+        return jsonify({'error': f'api not allowed: {api}'}), 403
+    url = _EM_ALLOWED_APIS[api]
+    # 转发除 _api 外的所有参数
+    params = {k: v for k, v in request.args.items() if k != '_api'}
+    try:
+        r = _session.get(url, params=params, timeout=15,
+                         headers={'User-Agent': 'Mozilla/5.0', 'Referer': 'https://quote.eastmoney.com/'})
+        return jsonify(r.json())
+    except Exception as e:
+        print(f"[ERROR] em_api_proxy ({api}): {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/akshare/em_news')
+@cached('em_news', 120)
+def em_news_proxy():
+    """代理东方财富 7x24 全球财经快讯 API"""
+    url = 'https://np-weblist.eastmoney.com/comm/web/getFastNewsList'
+    params = {
+        'client': 'web',
+        'biz': 'web_724',
+        'fastColumn': '102',
+        'sortEnd': '',
+        'pageSize': '20',
+        'req_trace': str(int(time.time() * 1000)),
+    }
+    try:
+        r = _session.get(url, params=params, timeout=10,
+                         headers={'User-Agent': 'Mozilla/5.0', 'Referer': 'https://kuaixun.eastmoney.com/'})
+        data = r.json()
+        news_list = data.get('data', {}).get('fastNewsList', [])
+        if not news_list:
+            return jsonify([])
+        result = []
+        for item in news_list[:15]:
+            code = item.get('code', '')
+            result.append({
+                'title': item.get('title', '--'),
+                'content': (item.get('summary', ''))[:200],
+                'time': item.get('showTime', '--'),
+                'url': f'https://finance.eastmoney.com/a/{code}.html' if code else '#',
+                'source': '东方财富',
+            })
+        return jsonify(result)
+    except Exception as e:
+        print(f"[ERROR] em_news_proxy: {e}")
         return jsonify({'error': str(e)}), 500
 
 

@@ -1,40 +1,22 @@
 <script setup>
 import { ref, onMounted, computed, watch } from 'vue'
-import { getSectorHeatmap, getAllStockData } from '../services/stockService.js'
+import { getSectorHeatmap } from '../services/stockService.js'
 
 const props = defineProps({ refreshTrigger: { type: Number, default: 0 }, refreshSilent: { type: Boolean, default: false } })
 
 const sectors = ref([])
-const sectorTopStocks = ref({})
 const loading = ref(true)
 const error = ref(null)
+const updateTime = ref('')
 
 const loadSectorData = async (silent = false) => {
   if (!silent) loading.value = true
   if (!silent) error.value = null
   try {
-    // 使用 getSectorHeatmap() 获取板块数据，同时取全量个股以补充领涨个股标签
-    const [heatmapData, allStocks] = await Promise.all([
-      getSectorHeatmap(),
-      getAllStockData(),
-    ])
+    const heatmapData = await getSectorHeatmap()
     // 按涨幅排序，第一名为主线，其余为观察
-    sectors.value = [...heatmapData].sort((a, b) => b.avgChange - a.avgChange)
-
-    // 计算每个板块的领涨个股（2-3只）
-    const topStocksMap = {}
-    allStocks.forEach(s => {
-      const sector = s.sector || s.industry || '其他'
-      if (!topStocksMap[sector]) topStocksMap[sector] = []
-      topStocksMap[sector].push(s)
-    })
-    Object.keys(topStocksMap).forEach(sector => {
-      topStocksMap[sector] = topStocksMap[sector]
-        .sort((a, b) => parseFloat(b.changePercent) - parseFloat(a.changePercent))
-        .slice(0, 3)
-        .map(s => s.name)
-    })
-    sectorTopStocks.value = topStocksMap
+    sectors.value = [...heatmapData].sort((a, b) => parseFloat(b.avgChange) - parseFloat(a.avgChange))
+    updateTime.value = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
   } catch (e) {
     console.error('加载板块分析数据失败:', e)
     error.value = '数据加载失败，请稍后重试'
@@ -43,7 +25,7 @@ const loadSectorData = async (silent = false) => {
   }
 }
 
-// 根据板块数据生成状态描述
+// 根据板块数据生成状态描述（基于板块均涨幅与涨跌比）
 const getStatus = (sector) => {
   const avg = parseFloat(sector.avgChange) || 0
   const ratio = sector.upCount / (sector.downCount || 1)
@@ -56,11 +38,15 @@ const getStatus = (sector) => {
   return '资金流出'
 }
 
-// 获取板块领涨个股标签（2-3只）
-const getTopStocks = (sector) => {
-  const names = sectorTopStocks.value[sector.name] || []
-  if (names.length > 0) return names
-  return sector.topStock ? [sector.topStock] : []
+// 获取板块领涨个股（直接使用板块数据中的领涨股票字段）
+const getTopStock = (sector) => {
+  if (sector.topStock && sector.topStock !== '--') {
+    return {
+      name: sector.topStock,
+      change: sector.topStockChange || '0.00',
+    }
+  }
+  return null
 }
 
 // 判断是否为主线（涨幅最高且为正）
@@ -88,7 +74,6 @@ onMounted(() => {
 <template>
   <div class="sector-analysis">
     <div class="card-header">
-      <span class="badge">3</span>
       <h3 class="card-title">主线&观察板块</h3>
     </div>
 
@@ -136,24 +121,24 @@ onMounted(() => {
           <span class="status-text">{{ getStatus(sector) }}</span>
         </div>
 
-        <!-- 底部领涨个股标签云 -->
+        <!-- 底部领涨个股 + 涨跌统计 -->
         <div class="card-bottom">
           <div class="updown-row">
             <span class="ud-item up">{{ sector.upCount }}涨</span>
             <span class="ud-item down">{{ sector.downCount }}跌</span>
           </div>
-          <div class="stock-tags" v-if="getTopStocks(sector).length">
-            <span
-              v-for="name in getTopStocks(sector)"
-              :key="name"
-              class="stock-tag"
-            >{{ name }}</span>
+          <div class="top-stock-row" v-if="getTopStock(sector)">
+            <span class="top-label">领涨</span>
+            <span class="top-name">{{ getTopStock(sector).name }}</span>
+            <span class="top-change" :class="getChangeClass(getTopStock(sector).change)">
+              {{ formatChange(getTopStock(sector).change) }}
+            </span>
           </div>
         </div>
       </div>
     </div>
 
-    <div class="sector-source">数据来源：akshare · 东方财富行业板块行情 · 状态标签基于板块均涨幅与涨跌比自动生成</div>
+    <div class="sector-source">数据来源：akshare · 东方财富行业板块行情 · 状态标签基于板块均涨幅与涨跌比自动生成 · {{ updateTime }}</div>
   </div>
 </template>
 
@@ -172,20 +157,6 @@ onMounted(() => {
   align-items: center;
   gap: 8px;
   margin-bottom: 12px;
-}
-.badge {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 20px;
-  height: 20px;
-  border-radius: var(--radius-sm);
-  background: var(--color-accent);
-  color: #fff;
-  font-size: 11px;
-  font-weight: 700;
-  font-family: var(--font-mono);
-  flex-shrink: 0;
 }
 .card-title {
   font-size: 16px;
@@ -345,7 +316,7 @@ onMounted(() => {
   color: var(--color-text-secondary);
 }
 
-/* 底部领涨个股标签云 */
+/* 底部领涨个股 + 涨跌统计 */
 .card-bottom {
   display: flex;
   flex-direction: column;
@@ -363,31 +334,46 @@ onMounted(() => {
 }
 .ud-item.up { color: var(--color-red); }
 .ud-item.down { color: var(--color-green); }
-.stock-tags {
+
+.top-stock-row {
   display: flex;
-  flex-wrap: wrap;
-  gap: 4px;
-}
-.stock-tag {
-  display: inline-flex;
   align-items: center;
-  max-width: 100%;
-  padding: 3px 7px;
-  border-radius: var(--radius-sm);
+  gap: 4px;
+  padding: 4px 6px;
   background: var(--color-surface-hover);
+  border-radius: var(--radius-sm);
   border: 1px solid var(--color-separator);
+}
+.sector-card.is-main .top-stock-row {
+  background: rgba(239, 68, 68, 0.08);
+  border-color: rgba(239, 68, 68, 0.15);
+}
+.top-label {
+  font-size: 9px;
+  color: var(--color-text-tertiary);
+  font-weight: 600;
+  flex-shrink: 0;
+}
+.top-name {
   font-size: 10px;
-  font-weight: 500;
-  color: var(--color-text-secondary);
+  font-weight: 600;
+  color: var(--color-text-primary);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  flex: 1;
+  min-width: 0;
 }
-.sector-card.is-main .stock-tag {
-  background: rgba(239, 68, 68, 0.08);
-  border-color: rgba(239, 68, 68, 0.15);
-  color: var(--color-text-primary);
+.top-change {
+  font-size: 10px;
+  font-weight: 700;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
 }
+.top-change.up { color: var(--color-red); }
+.top-change.down { color: var(--color-green); }
+.top-change.flat { color: var(--color-text-tertiary); }
 
 /* 移动端适配 */
 @media (max-width: 430px) {

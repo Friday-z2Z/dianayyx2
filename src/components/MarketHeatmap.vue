@@ -127,13 +127,16 @@ onMounted(() => {
           <div class="cell-top-stock" v-if="sector.topStock && sector.topStock !== '--'">
             <span class="top-label">领涨</span>
             <span class="top-name">{{ sector.topStock }}</span>
+            <span class="top-change" :class="getChangeClass(sector.topStockChange)">
+              {{ parseFloat(sector.topStockChange) > 0 ? '+' : '' }}{{ sector.topStockChange }}%
+            </span>
           </div>
         </div>
       </div>
     </div>
 
     <div class="heatmap-source">
-      数据来源：akshare · 东方财富行业板块 · {{ totalUp + totalDown }}只股票统计
+      数据来源：akshare · 东方财富行业板块 · 涨幅前15+跌幅前15共{{ sortedSectors.length }}个板块
     </div>
   </div>
 </template>
@@ -318,7 +321,19 @@ onMounted(() => {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  flex: 1;
+  min-width: 0;
 }
+.top-change {
+  font-size: 8px;
+  font-weight: 700;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+.top-change.up { color: #ef4444; }
+.top-change.down { color: #22c55e; }
+.top-change.flat { color: var(--color-text-tertiary); }
 
 .heatmap-source {
   font-size: 9px;

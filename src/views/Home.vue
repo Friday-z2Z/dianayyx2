@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed, onMounted, onUnmounted, onActivated, onDeactivated, nextTick } from 'vue'
+import { ref, computed, onMounted, onUnmounted, onActivated, onDeactivated, nextTick, watch } from 'vue'
 import { detectCity, getCurrentWeather } from '../services/weatherService.js'
 import NewsBar from '../components/NewsBar.vue'
 import MarketSummary from '../components/MarketSummary.vue'
@@ -21,12 +21,21 @@ const scrollEl = ref(null)
 const scrollY = ref(0)
 const isHeaderCompact = ref(false)
 
+// Sub-tab system - 环境优先，排行第二，去掉emoji图标
+const subTabs = [
+  { key: 'env', label: '环境' },
+  { key: 'ranking', label: '排行' },
+  { key: 'sector', label: '板块' },
+  { key: 'capital', label: '资金' },
+  { key: 'calendar', label: '日历' },
+]
+const activeSubTab = ref('env')
+
 // Double-tap to scroll to top
 let lastTapTime = 0
 const handleHeaderTap = () => {
   const now = Date.now()
   if (now - lastTapTime < 350) {
-    // Double tap detected - smooth scroll to top
     if (scrollEl.value) {
       scrollEl.value.scrollTo({ top: 0, behavior: 'smooth' })
     }
@@ -92,7 +101,6 @@ const handleGlobalRefresh = async () => {
   refreshSilent.value = false
   refreshKey.value++
   lastRefreshTime.value = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
-  // Also reload weather
   await loadWeather()
   setTimeout(() => { globalRefreshing.value = false }, 800)
 }
@@ -102,20 +110,21 @@ const handleScroll = () => {
   if (!scrollEl.value) return
   const top = scrollEl.value.scrollTop
   scrollY.value = top
-  // Continuously save scroll position so it's available even if
-  // onDeactivated fires after DOM is detached (where scrollTop would be 0)
   savedScrollTop.value = top
   isHeaderCompact.value = top > 80
 }
 
-// Timers (managed by onActivated/onDeactivated for KeepAlive support)
+// Sub-tab switch: scroll to tab content area
+const switchSubTab = (key) => {
+  activeSubTab.value = key
+}
+
+// Timers
 let autoRefreshTimer = null
 let clockTimer = null
 
 const startTimers = () => {
-  // Update clock every minute
   clockTimer = setInterval(() => { currentTime.value = new Date() }, 60000)
-  // Auto refresh market data every 2 minutes (silent - no loading indicator)
   autoRefreshTimer = setInterval(() => {
     refreshSilent.value = true
     refreshKey.value++
@@ -128,7 +137,6 @@ const stopTimers = () => {
   if (clockTimer) { clearInterval(clockTimer); clockTimer = null }
 }
 
-// onMounted: runs ONCE on first render (initial data fetch)
 onMounted(() => {
   setTimeout(() => { showContent.value = true }, 50)
   loadWeather()
@@ -136,17 +144,11 @@ onMounted(() => {
   startTimers()
 })
 
-// onActivated: runs when component becomes visible again (e.g. switching back from Profile)
-// Does NOT re-fetch data — just restores scroll position and restarts timers
 onActivated(() => {
-  // Refresh greeting time immediately
   currentTime.value = new Date()
-  // Restart timers if they were stopped (avoids double-start on first mount since onMounted already started them)
   if (!autoRefreshTimer && !clockTimer) {
     startTimers()
   }
-  // Restore scroll position after DOM is re-inserted by KeepAlive
-  // Try at multiple points to handle transition timing variations
   const restoreScroll = () => {
     if (scrollEl.value) {
       if (savedScrollTop.value > 0) {
@@ -158,22 +160,16 @@ onActivated(() => {
     restoreScroll()
     requestAnimationFrame(() => {
       restoreScroll()
-      // Final attempt after tab-switch transition completes (~150ms + buffer)
       setTimeout(restoreScroll, 200)
       setTimeout(restoreScroll, 400)
     })
   })
 })
 
-// onDeactivated: runs when component is hidden (switching to Profile)
-// Clear timers to prevent background data refreshes
-// Note: scroll position is already saved continuously by handleScroll,
-// so we don't need to save it here (scrollEl.scrollTop may be 0 if DOM is already detached)
 onDeactivated(() => {
   stopTimers()
 })
 
-// onUnmounted: final cleanup (component actually destroyed)
 onUnmounted(() => {
   stopTimers()
 })
@@ -187,7 +183,10 @@ onUnmounted(() => {
         <div class="sticky-inner">
           <div class="sticky-left">
             <transition name="header-morph" mode="out-in">
-              <span v-if="isHeaderCompact" class="compact-greeting" key="greeting">{{ greeting.text }}，Diana</span>
+              <span v-if="isHeaderCompact" class="compact-greeting" key="greeting">
+                {{ greeting.text }}，Diana
+                <span v-if="weather" class="compact-weather">{{ weather.city }} {{ weather.weatherIcon }} {{ weather.temperature }}° {{ weather.weatherDesc }}</span>
+              </span>
               <span v-else class="header-date" key="date">{{ dateStr }}</span>
             </transition>
           </div>
@@ -209,7 +208,16 @@ onUnmounted(() => {
         <div class="header-top">
           <p class="date-label">{{ dateStr }}</p>
         </div>
-        <h1 class="large-title">{{ greeting.text }}，Diana</h1>
+        <h1 class="large-title">
+          {{ greeting.text }}，Diana
+          <!-- 天气精简：城市 图标 温度 天气描述 -->
+          <span v-if="weather" class="title-weather">
+            <span class="tw-city">{{ weather.city }}</span>
+            <span class="tw-icon">{{ weather.weatherIcon }}</span>
+            <span class="tw-temp">{{ weather.temperature }}°</span>
+            <span class="tw-desc">{{ weather.weatherDesc }}</span>
+          </span>
+        </h1>
         <p class="header-sub">市场复盘仪表盘</p>
       </header>
 
@@ -218,113 +226,75 @@ onUnmounted(() => {
         <NewsBar :refresh-trigger="refreshKey" :refresh-silent="refreshSilent" />
       </section>
 
-      <!-- Weather Card (Compact) -->
-      <section class="weather-section">
-        <div v-if="weatherLoading" class="weather-card loading">
-          <div class="weather-skeleton">
-            <div class="skeleton-circle"></div>
-            <div class="skeleton-lines">
-              <div class="skeleton-line w60"></div>
-              <div class="skeleton-line w40"></div>
-            </div>
-          </div>
-        </div>
-        <div v-else-if="weather" class="weather-card">
-          <div class="weather-header-row">
-            <div class="weather-main">
-              <div class="weather-left">
-                <span class="weather-icon">{{ weather.weatherIcon }}</span>
-                <div class="weather-temp">
-                  <span class="temp-value">{{ weather.temperature }}</span>
-                  <span class="temp-unit">°C</span>
-                </div>
-              </div>
-              <div class="weather-right">
-                <span class="weather-desc">{{ weather.weatherDesc }}</span>
-                <span class="weather-city">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="11" height="11"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/></svg>
-                  {{ weather.city }}
-                </span>
-                <div class="weather-details">
-                  <span>体感 {{ weather.feelsLike }}°C</span>
-                  <span>湿度 {{ weather.humidity }}%</span>
-                </div>
-              </div>
-            </div>
-            <div v-if="weather.quality" class="weather-aqi-badge" :class="getAqiClass(weather.aqi)">
-              <span class="aqi-label">AQI</span>
-              <span class="aqi-value">{{ weather.aqi }}</span>
-              <span class="aqi-quality">{{ weather.quality }}</span>
-            </div>
-          </div>
-          <div class="weather-extra-row">
-            <div class="extra-item">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="13" height="13"><path d="M9.59 4.59A2 2 0 1 1 11 8H2m10.59 11.41A2 2 0 1 0 14 16H2m15.73-8.27A2.5 2.5 0 1 1 19.5 12H2"/></svg>
-              <span>{{ weather.windDirection }} {{ weather.windSpeed }}km/h</span>
-            </div>
-            <div class="extra-item">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="13" height="13"><path d="M12 2v20M2 12h20"/></svg>
-              <span>{{ weather.low }}° ~ {{ weather.high }}°</span>
-            </div>
-            <div class="extra-item">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="13" height="13"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
-              <span>更新于 {{ weather.updateTime }}</span>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      <!-- 1. 一句话总收口 -->
+      <!-- AI复盘 - 始终可见 -->
       <section class="dashboard-section">
         <MarketSummary :refresh-trigger="refreshKey" :refresh-silent="refreshSilent" />
       </section>
 
-      <!-- 2. 盘型/环境 -->
-      <section class="dashboard-section">
-        <MarketEnvironment :refresh-trigger="refreshKey" :refresh-silent="refreshSilent" />
-      </section>
+      <!-- 子Tab导航条 -->
+      <div class="sub-tab-bar" :class="{ compact: isHeaderCompact }">
+        <button
+          v-for="tab in subTabs"
+          :key="tab.key"
+          class="sub-tab-item"
+          :class="{ active: activeSubTab === tab.key }"
+          @click="switchSubTab(tab.key)"
+        >
+          <span class="sub-tab-label">{{ tab.label }}</span>
+        </button>
+      </div>
 
-      <!-- 3. 情绪运行阶段 -->
-      <section class="dashboard-section">
-        <SentimentGauge :refresh-trigger="refreshKey" :refresh-silent="refreshSilent" />
-      </section>
+      <!-- Tab内容区域 -->
+      <div class="sub-tab-content">
+        <!-- Tab: 排行 (市场排行前移) -->
+        <template v-if="activeSubTab === 'ranking'">
+          <section class="dashboard-section">
+            <MultiRanking :refresh-trigger="refreshKey" :refresh-silent="refreshSilent" />
+          </section>
+          <section class="dashboard-section">
+            <MarketDashboard :refresh-trigger="refreshKey" :refresh-silent="refreshSilent" />
+          </section>
+        </template>
 
-      <!-- 4. 主线&观察板块 -->
-      <section class="dashboard-section">
-        <SectorAnalysis :refresh-trigger="refreshKey" :refresh-silent="refreshSilent" />
-      </section>
+        <!-- Tab: 板块 -->
+        <template v-if="activeSubTab === 'sector'">
+          <section class="dashboard-section">
+            <SectorAnalysis :refresh-trigger="refreshKey" :refresh-silent="refreshSilent" />
+          </section>
+          <section class="dashboard-section">
+            <MarketHeatmap :refresh-trigger="refreshKey" :refresh-silent="refreshSilent" />
+          </section>
+        </template>
 
-      <!-- 5. 全市场情绪分时图 -->
-      <section class="dashboard-section">
-        <MarketDashboard :refresh-trigger="refreshKey" :refresh-silent="refreshSilent" />
-      </section>
+        <!-- Tab: 资金 -->
+        <template v-if="activeSubTab === 'capital'">
+          <section class="dashboard-section">
+            <FundFlowCard :refresh-trigger="refreshKey" :refresh-silent="refreshSilent" />
+          </section>
+        </template>
 
-      <!-- 6. 资金流向（独立全宽） -->
-      <section class="dashboard-section">
-        <FundFlowCard :refresh-trigger="refreshKey" :refresh-silent="refreshSilent" />
-      </section>
+        <!-- Tab: 环境 -->
+        <template v-if="activeSubTab === 'env'">
+          <section class="dashboard-section">
+            <MarketEnvironment :refresh-trigger="refreshKey" :refresh-silent="refreshSilent" />
+          </section>
+          <section class="dashboard-section">
+            <SentimentGauge :refresh-trigger="refreshKey" :refresh-silent="refreshSilent" />
+          </section>
+        </template>
 
-      <!-- 7. 行业热力图（独立全宽） -->
-      <section class="dashboard-section">
-        <MarketHeatmap :refresh-trigger="refreshKey" :refresh-silent="refreshSilent" />
-      </section>
+        <!-- Tab: 日历 -->
+        <template v-if="activeSubTab === 'calendar'">
+          <section class="dashboard-section">
+            <MarketCalendar :refresh-trigger="refreshKey" :refresh-silent="refreshSilent" />
+          </section>
+          <section class="dashboard-section">
+            <GlobalIndices :refresh-trigger="refreshKey" :refresh-silent="refreshSilent" />
+          </section>
+        </template>
+      </div>
 
-      <!-- 8. 多榜单同屏 -->
-      <section class="dashboard-section">
-        <MultiRanking :refresh-trigger="refreshKey" :refresh-silent="refreshSilent" />
-      </section>
-
-      <!-- 9. 新股+解禁+财报日历 -->
-      <section class="dashboard-section">
-        <MarketCalendar :refresh-trigger="refreshKey" :refresh-silent="refreshSilent" />
-      </section>
-
-      <!-- 10. 全球指数+汇率 -->
-      <section class="dashboard-section">
-        <GlobalIndices :refresh-trigger="refreshKey" :refresh-silent="refreshSilent" />
-      </section>
-
-      <!-- 11. 风险边界 -->
+      <!-- 风险边界 - 始终可见 -->
       <section class="dashboard-section">
         <RiskWarning :refresh-trigger="refreshKey" :refresh-silent="refreshSilent" />
       </section>
@@ -364,10 +334,10 @@ onUnmounted(() => {
   padding: 0;
 }
 .sticky-header.compact {
-  background: rgba(13, 17, 23, 0.85);
+  background: rgba(13, 17, 23, 0.92);
   backdrop-filter: blur(40px) saturate(180%);
   -webkit-backdrop-filter: blur(40px) saturate(180%);
-  border-bottom: 1px solid var(--color-separator);
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.4);
 }
 .sticky-inner {
   display: flex;
@@ -375,6 +345,12 @@ onUnmounted(() => {
   justify-content: space-between;
   padding: 12px 16px;
   min-height: 44px;
+}
+.sticky-header.compact .sticky-inner {
+  padding: 8px 16px;
+  height: 48px;
+  box-sizing: border-box;
+  border-bottom: 1px solid rgba(139, 148, 158, 0.3);
 }
 .sticky-left { flex: 1; min-width: 0; overflow: hidden; }
 .compact-greeting {
@@ -441,96 +417,104 @@ onUnmounted(() => {
   color: var(--color-text-primary);
   letter-spacing: -0.03em; line-height: 1.15; margin: 0;
 }
+/* 天气内联在标题后 */
+.title-weather {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 10px;
+  font-size: 15px;
+  font-weight: 500;
+  color: var(--color-text-secondary);
+  vertical-align: middle;
+}
+.tw-city {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--color-text-tertiary);
+}
+.tw-icon { font-size: 15px; line-height: 1; }
+.tw-temp {
+  font-size: 16px; font-weight: 600;
+  color: var(--color-text-primary);
+  font-variant-numeric: tabular-nums;
+}
+.tw-desc {
+  font-weight: 500;
+  color: var(--color-text-tertiary);
+}
 .header-sub {
   font-size: 13px; font-weight: 500;
   color: var(--color-text-tertiary);
   margin-top: 4px;
 }
-
-/* ===== Weather Section ===== */
-.weather-section { padding: 12px 16px 0; }
-.weather-card {
-  background: var(--color-surface);
-  border-radius: var(--radius-lg);
-  padding: 16px;
-  border: 1px solid var(--color-separator);
-  overflow: hidden;
-}
-.weather-card.loading { min-height: 80px; }
-.weather-skeleton {
-  display: flex; align-items: center; gap: 16px;
-}
-.skeleton-circle {
-  width: 48px; height: 48px; border-radius: 50%;
-  background: linear-gradient(90deg, var(--color-surface-elevated) 25%, var(--color-surface-hover) 50%, var(--color-surface-elevated) 75%);
-  background-size: 200% 100%; animation: skeleton-shimmer 1.5s infinite;
-}
-.skeleton-lines { flex: 1; display: flex; flex-direction: column; gap: 8px; }
-.skeleton-line {
-  height: 12px; border-radius: 6px;
-  background: linear-gradient(90deg, var(--color-surface-elevated) 25%, var(--color-surface-hover) 50%, var(--color-surface-elevated) 75%);
-  background-size: 200% 100%; animation: skeleton-shimmer 1.5s infinite;
-}
-.skeleton-line.w60 { width: 60%; }
-.skeleton-line.w40 { width: 40%; }
-@keyframes skeleton-shimmer {
-  0% { background-position: 200% 0; }
-  100% { background-position: -200% 0; }
+/* 吸顶时的精简天气 */
+.compact-weather {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--color-text-secondary);
+  margin-left: 6px;
 }
 
-.weather-header-row {
-  display: flex; align-items: flex-start; justify-content: space-between;
-  gap: 12px; margin-bottom: 10px;
+/* ===== Sub-Tab Bar ===== */
+.sub-tab-bar {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  padding: 0 16px;
+  position: sticky;
+  top: 44px;
+  z-index: 90;
+  background: var(--color-bg);
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+  transition: all 0.35s var(--ease-out-expo);
 }
-.weather-main { display: flex; align-items: center; gap: 16px; flex: 1; }
-.weather-left { display: flex; align-items: center; gap: 10px; }
-.weather-icon { font-size: 36px; line-height: 1; }
-.weather-temp { display: flex; align-items: flex-start; }
-.temp-value {
-  font-size: 40px; font-weight: 300;
+.sub-tab-bar::-webkit-scrollbar { display: none; }
+.sub-tab-bar.compact {
+  top: 48px;
+  background: rgba(13, 17, 23, 0.92);
+  backdrop-filter: blur(40px) saturate(180%);
+  -webkit-backdrop-filter: blur(40px) saturate(180%);
+  border-bottom: 1px solid var(--color-separator);
+}
+.sub-tab-item {
+  position: relative;
+  padding: 12px 0;
+  margin-right: 24px;
+  background: none;
+  border: none;
+  color: var(--color-text-tertiary);
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
+  transition: color 0.2s var(--ease-smooth);
+}
+.sub-tab-item:last-child { margin-right: 0; }
+.sub-tab-item:active { color: var(--color-text-secondary); }
+.sub-tab-item.active {
   color: var(--color-text-primary);
-  letter-spacing: -0.04em; line-height: 1;
+  font-weight: 700;
 }
-.temp-unit {
-  font-size: 16px; font-weight: 300;
-  color: var(--color-text-secondary); margin-top: 4px;
+.sub-tab-item.active::after {
+  content: '';
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: var(--color-accent);
+  border-radius: 1px;
 }
-.weather-right { flex: 1; display: flex; flex-direction: column; gap: 3px; }
-.weather-desc { font-size: 15px; font-weight: 600; color: var(--color-text-primary); }
-.weather-city {
-  font-size: 12px; color: var(--color-text-secondary);
-  display: flex; align-items: center; gap: 3px;
-}
-.weather-city svg { opacity: 0.6; }
-.weather-details {
-  display: flex; gap: 12px; font-size: 11px;
-  color: var(--color-text-tertiary); margin-top: 2px;
-}
+.sub-tab-label { letter-spacing: 0.02em; }
 
-/* AQI Badge */
-.weather-aqi-badge {
-  display: flex; flex-direction: column; align-items: center;
-  padding: 5px 9px; border-radius: 8px;
-  background: rgba(34, 197, 94, 0.1); flex-shrink: 0; min-width: 48px;
+/* ===== Sub-Tab Content ===== */
+.sub-tab-content {
+  min-height: 200px;
 }
-.weather-aqi-badge.aqi-good { background: rgba(34, 197, 94, 0.1); }
-.weather-aqi-badge.aqi-moderate { background: rgba(234, 179, 8, 0.12); }
-.weather-aqi-badge.aqi-unhealthy-sensitive { background: rgba(249, 115, 22, 0.12); }
-.weather-aqi-badge.aqi-unhealthy { background: rgba(239, 68, 68, 0.1); }
-.weather-aqi-badge.aqi-hazardous { background: rgba(168, 85, 247, 0.12); }
-.aqi-label { font-size: 8px; color: var(--color-text-tertiary); font-weight: 600; letter-spacing: 0.05em; }
-.aqi-value { font-size: 16px; font-weight: 700; color: var(--color-text-primary); line-height: 1.2; }
-.aqi-quality { font-size: 9px; font-weight: 600; color: var(--color-text-secondary); }
-
-.weather-extra-row {
-  display: flex; gap: 14px; padding: 8px 0 0;
-  border-top: 1px solid var(--color-separator);
-}
-.extra-item {
-  display: flex; align-items: center; gap: 4px;
-  font-size: 11px; color: var(--color-text-tertiary);
-}
-.extra-item svg { color: var(--color-text-tertiary); opacity: 0.6; }
 
 /* ===== Dashboard Sections ===== */
 .dashboard-section {

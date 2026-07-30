@@ -1,28 +1,34 @@
 <script setup>
-import { ref, onMounted, onUnmounted, watch, nextTick } from 'vue'
+import { ref, onMounted, onUnmounted, onActivated, onDeactivated, watch, nextTick } from 'vue'
 import * as echarts from 'echarts'
-import { getNorthboundCapital, getFinancingData } from '../services/stockService.js'
+import { getCapitalRanking, getFinancingData } from '../services/stockService.js'
 
 const props = defineProps({ refreshTrigger: { type: Number, default: 0 }, refreshSilent: { type: Boolean, default: false } })
 
-const activeTab = ref('northbound')
-const northboundData = ref({ sh: [], sz: [], total: [], updateTime: '' })
-const northboundNote = ref('')
+const activeTab = ref('mainforce')
+const fundRanking = ref({ inflow: [], outflow: [] })
 const financingData = ref({ balance: 0, buy: 0, repay: 0, net: 0, timeSharing: [] })
 const loading = ref(true)
 const refreshing = ref(false)
 let chartInstance = null
 
+// 格式化资金流向（元 → 亿/万），统一单位，支持正负数
 const formatFlow = (value) => {
+  if (value == null || isNaN(value)) return '--'
   const abs = Math.abs(value)
-  const sign = value >= 0 ? '+' : '-'
-  if (abs >= 10000) return sign + (abs / 10000).toFixed(2) + '亿'
-  return sign + abs.toFixed(0) + '万'
+  const sign = value < 0 ? '-' : ''
+  if (abs >= 1e8) return sign + (abs / 1e8).toFixed(2) + '亿'
+  if (abs >= 1e4) return sign + (abs / 1e4).toFixed(0) + '万'
+  return sign + abs.toFixed(0)
 }
 
+// 格式化金额（元 → 亿/万），不带正负号
 const formatMoney = (value) => {
-  if (Math.abs(value) >= 10000) return (value / 10000).toFixed(2) + '亿'
-  return value.toFixed(0) + '万'
+  if (value == null || isNaN(value)) return '--'
+  const abs = Math.abs(value)
+  if (abs >= 1e8) return (value / 1e8).toFixed(2) + '亿'
+  if (abs >= 1e4) return (value / 1e4).toFixed(0) + '万'
+  return value.toFixed(0)
 }
 
 const getFlowClass = (value) => value > 0 ? 'up' : value < 0 ? 'down' : ''
@@ -30,114 +36,209 @@ const getFlowClass = (value) => value > 0 ? 'up' : value < 0 ? 'down' : ''
 const loadData = async (silent = false) => {
   if (!silent) loading.value = true
   try {
-    if (activeTab.value === 'northbound') {
-      const data = await getNorthboundCapital()
-      northboundData.value = data
-      northboundNote.value = data.note || ''
+    if (activeTab.value === 'mainforce') {
+      const data = await getCapitalRanking()
+      fundRanking.value = data
     } else {
       financingData.value = await getFinancingData()
     }
-    await nextTick()
-    setTimeout(() => initChart(), 80)
   } catch (e) {
     console.error('加载资金数据失败:', e)
   } finally {
     if (!silent) loading.value = false
   }
+  // 确保 loading=false 后 DOM 已更新，图表容器可见再初始化
+  await nextTick()
+  requestAnimationFrame(() => {
+    setTimeout(() => initChart(), 50)
+  })
 }
 
 const initChart = () => {
   const el = document.getElementById('fund-flow-chart')
-  if (!el) return
+  if (!el || el.clientWidth === 0 || el.clientHeight === 0) return
   if (chartInstance) chartInstance.dispose()
   chartInstance = echarts.init(el)
 
-  let series = []
-  let xData = []
-  let tooltipFormatter
+  if (activeTab.value === 'mainforce') {
+    const data = fundRanking.value
+    // 取前8流入和前8流出
+    const topInflow = (data.inflow || []).slice(0, 8)
+    const topOutflow = (data.outflow || []).slice(0, 8)
 
-  if (activeTab.value === 'northbound') {
-    const data = northboundData.value
-    xData = data.total.map(p => p.time)
-    series = [
-      {
-        name: '沪股通', type: 'line', data: data.sh.map(p => p.value), symbol: 'none',
-        lineStyle: { width: 1.2, color: '#007AFF' }
-      },
-      {
-        name: '深股通', type: 'line', data: data.sz.map(p => p.value), symbol: 'none',
-        lineStyle: { width: 1.2, color: '#AF52DE' }
-      },
-      {
-        name: '合计', type: 'line', data: data.total.map(p => p.value), symbol: 'none',
-        lineStyle: { width: 1.8, color: '#F23030' },
-        areaStyle: {
-          color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-            { offset: 0, color: 'rgba(242,48,48,0.12)' },
-            { offset: 1, color: 'rgba(242,48,48,0.01)' }
-          ])
-        }
-      }
+    // 合并：流出在底部（负值），流入在顶部（正值）
+    // 从下到上：小流出 → 大流出 → 小流入 → 大流入（金字塔形）
+    // 所有值转为万元，统一单位，便于图表渲染
+    const allItems = [
+      ...topOutflow.slice().reverse().map(s => ({
+        name: s.name,
+        value: (s.mainNetInflow || 0) / 1e4,
+      })),
+      ...topInflow.slice().reverse().map(s => ({
+        name: s.name,
+        value: (s.mainNetInflow || 0) / 1e4,
+      })),
     ]
-    tooltipFormatter = (params) => {
-      let html = `<div style="font-size:11px;line-height:1.6"><b>${params[0].name}</b>`
-      params.forEach(p => {
-        const c = p.value >= 0 ? '#F23030' : '#00B42A'
-        html += `<br/>${p.seriesName}: <span style="color:${c};font-weight:600">${formatFlow(p.value)}</span>`
-      })
-      return html + '</div>'
-    }
-  } else {
-    const data = financingData.value
-    xData = data.timeSharing.map((_, i) => {
-      const m = i * 5 + 30
-      const h = 9 + Math.floor(m / 60)
-      const mm = m % 60
-      if (h >= 11 && h < 13) return ''
-      return `${String(h).padStart(2, '0')}:${String(mm).padStart(2, '0')}`
-    }).filter(t => t)
-    series = [{
-      name: '融资净买入', type: 'line', data: data.timeSharing, symbol: 'none',
-      lineStyle: { width: 1.8, color: '#FF9500' },
-      areaStyle: {
-        color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-          { offset: 0, color: 'rgba(255,149,0,0.12)' },
-          { offset: 1, color: 'rgba(255,149,0,0.01)' }
-        ])
-      }
-    }]
-    tooltipFormatter = (params) => {
-      return `<div style="font-size:11px"><b>${params[0].name}</b><br/>净买入: <span style="color:#FF9500;font-weight:600">${formatFlow(params[0].value)}</span></div>`
-    }
-  }
 
-  chartInstance.setOption({
-    backgroundColor: 'transparent',
-    grid: { left: 45, right: 10, top: 10, bottom: 20 },
-    tooltip: {
-      trigger: 'axis',
-      backgroundColor: 'rgba(20,20,20,0.92)',
-      borderColor: 'transparent',
-      textStyle: { color: '#fff', fontSize: 11 },
-      formatter: tooltipFormatter
-    },
-    xAxis: {
-      type: 'category', data: xData, boundaryGap: false,
-      axisLine: { lineStyle: { color: 'rgba(60,60,67,0.12)' } },
-      axisLabel: { color: '#8E8E93', fontSize: 9, interval: Math.floor(xData.length / 3) },
-      splitLine: { show: false }
-    },
-    yAxis: {
-      type: 'value', axisLine: { show: false },
-      axisLabel: {
-        color: '#8E8E93', fontSize: 9,
-        formatter: (v) => Math.abs(v) >= 10000 ? (v / 10000).toFixed(0) + '亿' : v.toFixed(0) + '万'
+    chartInstance.setOption({
+      backgroundColor: 'transparent',
+      grid: { left: 60, right: 55, top: 5, bottom: 5 },
+      tooltip: {
+        trigger: 'axis',
+        backgroundColor: 'rgba(20,20,20,0.92)',
+        borderColor: 'transparent',
+        textStyle: { color: '#fff', fontSize: 11 },
+        formatter: (params) => {
+          const p = params[0]
+          const item = allItems[p.dataIndex]
+          const rawValue = item.value * 1e4
+          return `<div style="font-size:11px"><b>${item.name}</b><br/>主力净流入: <span style="color:${item.value >= 0 ? '#F23030' : '#00B42A'};font-weight:600">${formatFlow(rawValue)}</span></div>`
+        }
       },
-      splitLine: { lineStyle: { color: 'rgba(60,60,67,0.06)' } },
-      splitNumber: 3
-    },
-    series
-  })
+      xAxis: {
+        type: 'value',
+        axisLine: { show: false },
+        axisLabel: {
+          color: '#8E8E93', fontSize: 9,
+          formatter: (v) => {
+            const abs = Math.abs(v)
+            if (abs >= 10000) return (v / 10000).toFixed(1) + '亿'
+            return v.toFixed(0) + '万'
+          }
+        },
+        splitLine: { lineStyle: { color: 'rgba(60,60,67,0.06)' } },
+        splitNumber: 4
+      },
+      yAxis: {
+        type: 'category',
+        data: allItems.map(s => s.name),
+        axisLine: { show: false },
+        axisTick: { show: false },
+        axisLabel: { color: '#8E8E93', fontSize: 9, width: 55, overflow: 'truncate' }
+      },
+      series: [{
+        type: 'bar',
+        data: allItems.map(s => ({
+          // 统一朝右：使用绝对值
+          value: Math.abs(s.value),
+          itemStyle: {
+            // 正值(流入)红色，负值(流出)绿色 —— A股惯例
+            color: s.value >= 0
+              ? new echarts.graphic.LinearGradient(0, 0, 1, 0, [
+                  { offset: 0, color: 'rgba(242,48,48,0.25)' },
+                  { offset: 1, color: 'rgba(242,48,48,0.9)' }
+                ])
+              : new echarts.graphic.LinearGradient(0, 0, 1, 0, [
+                  { offset: 0, color: 'rgba(0,180,42,0.25)' },
+                  { offset: 1, color: 'rgba(0,180,42,0.9)' }
+                ])
+          },
+          label: {
+            show: true,
+            position: 'right',
+            formatter: () => formatFlow(s.value * 1e4),
+            fontSize: 8,
+            color: s.value >= 0 ? '#F23030' : '#00B42A'
+          }
+        })),
+        barWidth: '60%',
+      }]
+    })
+  } else {
+    // 融资融券图表：双轴（余额柱+净买入线）
+    const data = financingData.value
+    const ts = data.timeSharing || []
+    if (ts.length === 0) {
+      chartInstance.setOption({
+        backgroundColor: 'transparent',
+        title: { text: '暂无融资数据', left: 'center', top: 'center', textStyle: { color: '#8E8E93', fontSize: 12 } }
+      })
+      return
+    }
+    const xData = ts.map(t => t.date)
+    const balanceData = ts.map(t => t.balance / 1e4)
+    const netData = ts.map(t => t.net / 1e4)
+
+    chartInstance.setOption({
+      backgroundColor: 'transparent',
+      grid: { left: 50, right: 50, top: 32, bottom: 22 },
+      tooltip: {
+        trigger: 'axis',
+        backgroundColor: 'rgba(20,20,20,0.92)',
+        borderColor: 'transparent',
+        textStyle: { color: '#fff', fontSize: 11 },
+        formatter: (params) => {
+          let html = `<div style="font-size:11px"><b>${params[0].axisValue}</b>`
+          params.forEach(p => {
+            const rawVal = p.value * 1e4
+            const color = p.seriesName === '融资余额' ? '#5856D6' : (p.value >= 0 ? '#F23030' : '#00B42A')
+            html += `<br/>${p.seriesName}: <span style="color:${color};font-weight:600">${formatFlow(rawVal)}</span>`
+          })
+          html += '</div>'
+          return html
+        }
+      },
+      legend: {
+        data: ['融资余额', '净买入'],
+        top: 0, left: 'center',
+        textStyle: { color: '#8E8E93', fontSize: 9 },
+        itemWidth: 10, itemHeight: 6,
+        itemGap: 12
+      },
+      xAxis: {
+        type: 'category', data: xData, boundaryGap: true,
+        axisLine: { lineStyle: { color: 'rgba(60,60,67,0.12)' } },
+        axisLabel: { color: '#8E8E93', fontSize: 9, interval: Math.floor(xData.length / 4) },
+        splitLine: { show: false }
+      },
+      yAxis: [
+        {
+          type: 'value',
+          axisLine: { show: false },
+          axisLabel: {
+            color: '#8E8E93', fontSize: 9,
+            formatter: (v) => Math.abs(v) >= 10000 ? (v / 10000).toFixed(1) + '亿' : v.toFixed(0) + '万'
+          },
+          splitLine: { lineStyle: { color: 'rgba(60,60,67,0.06)' } },
+          splitNumber: 3
+        },
+        {
+          type: 'value',
+          axisLine: { show: false },
+          axisLabel: {
+            color: '#8E8E93', fontSize: 9,
+            formatter: (v) => Math.abs(v) >= 10000 ? (v / 10000).toFixed(1) + '亿' : v.toFixed(0) + '万'
+          },
+          splitLine: { show: false },
+          splitNumber: 3
+        }
+      ],
+      series: [
+        {
+          name: '融资余额', type: 'bar', data: balanceData, yAxisIndex: 0,
+          barWidth: '50%',
+          itemStyle: {
+            color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+              { offset: 0, color: 'rgba(88,86,214,0.8)' },
+              { offset: 1, color: 'rgba(88,86,214,0.2)' }
+            ])
+          }
+        },
+        {
+          name: '净买入', type: 'line', data: netData, yAxisIndex: 1,
+          symbol: 'circle', symbolSize: 4,
+          lineStyle: { width: 1.8, color: '#FF9500' },
+          itemStyle: { color: '#FF9500' },
+          areaStyle: {
+            color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+              { offset: 0, color: 'rgba(255,149,0,0.12)' },
+              { offset: 1, color: 'rgba(255,149,0,0.01)' }
+            ])
+          }
+        }
+      ]
+    })
+  }
 }
 
 const refresh = async () => {
@@ -146,16 +247,30 @@ const refresh = async () => {
   refreshing.value = false
 }
 
+const handleResize = () => chartInstance?.resize()
+
 watch(activeTab, () => loadData())
 watch(() => props.refreshTrigger, () => loadData(props.refreshSilent))
 
 onMounted(() => {
   loadData()
-  window.addEventListener('resize', () => chartInstance?.resize())
+  window.addEventListener('resize', handleResize)
+})
+
+onActivated(() => {
+  // KeepAlive 激活时重绘图表
+  nextTick(() => setTimeout(() => initChart(), 50))
+})
+
+onDeactivated(() => {
+  // KeepAlive 停用时释放图表
+  chartInstance?.dispose()
+  chartInstance = null
 })
 
 onUnmounted(() => {
   chartInstance?.dispose()
+  window.removeEventListener('resize', handleResize)
 })
 </script>
 
@@ -171,45 +286,34 @@ onUnmounted(() => {
           </svg>
         </button>
         <div class="tab-switcher">
-          <button :class="{ active: activeTab === 'northbound' }" @click="activeTab = 'northbound'">北向</button>
+          <button :class="{ active: activeTab === 'mainforce' }" @click="activeTab = 'mainforce'">主力</button>
           <button :class="{ active: activeTab === 'financing' }" @click="activeTab = 'financing'">融资</button>
         </div>
       </div>
     </div>
 
     <div class="chart-wrap">
-      <div id="fund-flow-chart" style="height: 150px; width: 100%;"></div>
+      <div v-if="loading" class="loading-state">
+        <div class="mini-spinner"></div>
+        <span>加载中...</span>
+      </div>
+      <div v-else id="fund-flow-chart" style="height: 260px; width: 100%;"></div>
     </div>
 
-    <!-- 北向汇总 -->
-    <div class="fund-summary" v-if="activeTab === 'northbound'">
+    <!-- 主力资金汇总 -->
+    <div class="fund-summary" v-if="activeTab === 'mainforce' && !loading">
       <div class="summary-item">
-        <span class="item-label">沪股通</span>
-        <span class="item-value" :class="getFlowClass(northboundData.sh[northboundData.sh.length - 1]?.value)">
-          {{ northboundData.sh.length ? formatFlow(northboundData.sh[northboundData.sh.length - 1].value) : '--' }}
-        </span>
+        <span class="item-label">净流入第一</span>
+        <span class="item-value up">{{ fundRanking.inflow.length ? formatFlow(fundRanking.inflow[0].mainNetInflow) : '--' }}</span>
       </div>
       <div class="summary-item">
-        <span class="item-label">深股通</span>
-        <span class="item-value" :class="getFlowClass(northboundData.sz[northboundData.sz.length - 1]?.value)">
-          {{ northboundData.sz.length ? formatFlow(northboundData.sz[northboundData.sz.length - 1].value) : '--' }}
-        </span>
+        <span class="item-label">净流出第一</span>
+        <span class="item-value down">{{ fundRanking.outflow.length ? formatFlow(fundRanking.outflow[0].mainNetInflow) : '--' }}</span>
       </div>
-      <div class="summary-item total">
-        <span class="item-label">合计</span>
-        <span class="item-value" :class="getFlowClass(northboundData.total[northboundData.total.length - 1]?.value)">
-          {{ northboundData.total.length ? formatFlow(northboundData.total[northboundData.total.length - 1].value) : '--' }}
-        </span>
-      </div>
-    </div>
-
-    <!-- 北向数据说明 -->
-    <div class="fund-note" v-if="activeTab === 'northbound' && northboundNote">
-      {{ northboundNote }}
     </div>
 
     <!-- 融资汇总 -->
-    <div class="fund-summary" v-else>
+    <div class="fund-summary" v-else-if="!loading">
       <div class="summary-item">
         <span class="item-label">融资余额</span>
         <span class="item-value">{{ formatMoney(financingData.balance) }}</span>
@@ -227,7 +331,7 @@ onUnmounted(() => {
     </div>
 
     <div class="fund-source">
-      数据来源：akshare · {{ activeTab === 'northbound' ? '沪深港通资金流向' : '融资融券交易数据' }}
+      数据来源：东方财富 · {{ activeTab === 'mainforce' ? '今日主力资金流向排行' : '融资融券交易数据' }}
     </div>
   </div>
 </template>
@@ -273,6 +377,15 @@ onUnmounted(() => {
 }
 .chart-wrap { margin-bottom: 6px; }
 
+.loading-state {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  height: 260px; gap: 8px; color: var(--color-text-tertiary); font-size: 12px;
+}
+.mini-spinner {
+  width: 18px; height: 18px; border: 2px solid #30363d;
+  border-top-color: #2563eb; border-radius: 50%; animation: spin 0.8s linear infinite;
+}
+
 .fund-summary {
   display: flex; gap: 0; padding-top: 8px;
   border-top: 0.5px solid var(--color-separator);
@@ -286,18 +399,6 @@ onUnmounted(() => {
 .item-value { font-size: 13px; font-weight: 700; font-variant-numeric: tabular-nums; color: var(--color-text-primary); }
 .item-value.up { color: #ef4444; }
 .item-value.down { color: #22c55e; }
-.summary-item.total .item-value { color: #ef4444; }
-
-.fund-note {
-  font-size: 10px;
-  color: var(--color-text-tertiary);
-  padding: 6px 8px;
-  margin-top: 4px;
-  background: var(--color-surface-hover);
-  border-radius: var(--radius-sm);
-  line-height: 1.4;
-  text-align: center;
-}
 
 .fund-source {
   font-size: 9px;

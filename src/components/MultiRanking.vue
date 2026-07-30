@@ -55,6 +55,16 @@ const getChangeColor = (val) => {
   return n > 0 ? '#F23030' : n < 0 ? '#00B42A' : '#8E8E93'
 }
 
+// 格式化资金流向（元 → 亿/万）
+const formatFlowValue = (value) => {
+  if (value == null || isNaN(value)) return '--'
+  const abs = Math.abs(value)
+  const sign = value < 0 ? '-' : ''
+  if (abs >= 1e8) return sign + (abs / 1e8).toFixed(2) + '亿'
+  if (abs >= 1e4) return sign + (abs / 1e4).toFixed(0) + '万'
+  return sign + abs.toFixed(0)
+}
+
 let refreshTimer = null
 watch(() => props.refreshTrigger, () => loadRankingData(props.refreshSilent))
 onMounted(() => {
@@ -114,7 +124,7 @@ onUnmounted(() => {
               <span class="rank-code">{{ stock.code }}</span>
             </div>
             <span class="rank-value" :style="{ color: getChangeColor(stock.changePercent) }">
-              {{ activeRank === 'price' ? (parseFloat(stock.changePercent) > 0 ? '+' : '') + stock.changePercent + '%' : stock.volume }}
+              {{ activeRank === 'price' ? (parseFloat(stock.changePercent) > 0 ? '+' : '') + stock.changePercent + '%' : activeRank === 'northbound' ? (parseFloat(stock.mainNetInflowPct || 0) > 0 ? '+' : '') + parseFloat(stock.mainNetInflowPct || 0).toFixed(2) + '%' : formatFlowValue(stock.mainNetInflow) }}
             </span>
           </div>
         </div>
@@ -138,7 +148,7 @@ onUnmounted(() => {
               <span class="rank-code">{{ stock.code }}</span>
             </div>
             <span class="rank-value" :style="{ color: getChangeColor(stock.changePercent) }">
-              {{ activeRank === 'price' ? (parseFloat(stock.changePercent) > 0 ? '+' : '') + stock.changePercent + '%' : stock.volume }}
+              {{ activeRank === 'price' ? (parseFloat(stock.changePercent) > 0 ? '+' : '') + stock.changePercent + '%' : activeRank === 'northbound' ? (parseFloat(stock.mainNetInflowPct || 0) > 0 ? '+' : '') + parseFloat(stock.mainNetInflowPct || 0).toFixed(2) + '%' : formatFlowValue(stock.mainNetInflow) }}
             </span>
           </div>
         </div>

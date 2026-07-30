@@ -1,74 +1,204 @@
 <script setup>
 import { ref, onMounted, computed, watch } from 'vue'
-import { getMarketSentiment } from '../services/stockService.js'
+import { getMarketAnalysis, getMarketSentiment, getSectorHeatmap } from '../services/stockService.js'
 
 const props = defineProps({ refreshTrigger: { type: Number, default: 0 }, refreshSilent: { type: Boolean, default: false } })
 
-const sentiment = ref(null)
 const loading = ref(true)
 const error = ref(null)
+const marketData = ref(null)
+const sentimentData = ref(null)
+const sectorData = ref([])
+const updateTime = ref('')
+const dataSources = ref([])
 
 const loadData = async (silent = false) => {
   if (!silent) loading.value = true
   if (!silent) error.value = null
   try {
-    sentiment.value = await getMarketSentiment()
+    const [analysis, sentiment, sectors] = await Promise.all([
+      getMarketAnalysis(),
+      getMarketSentiment().catch(() => null),
+      getSectorHeatmap().catch(() => []),
+    ])
+    marketData.value = analysis
+    sentimentData.value = sentiment
+    sectorData.value = sectors
+    updateTime.value = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
   } catch (e) {
-    console.error('加载市场情绪数据失败:', e)
-    error.value = '数据加载失败，请稍后重试'
+    console.error('加载风险数据失败:', e)
+    error.value = e?.message || '数据加载失败'
   } finally {
     if (!silent) loading.value = false
   }
 }
 
-// 炸板率：炸板数 / (涨停数 + 炸板数)
-const bombRate = computed(() => {
-  if (!sentiment.value) return 0
-  const { limitUpCount = 0, bombCount = 0 } = sentiment.value
-  const total = limitUpCount + bombCount
-  return total > 0 ? (bombCount / total) * 100 : 0
+const retry = () => loadData()
+
+/**
+ * 基于多维度实时数据生成数据驱动型风险提示
+ * 每条风险都引用具体数据值，并标注来源
+ */
+const riskItems = computed(() => {
+  if (!marketData.value) return []
+  const d = marketData.value
+  const s = sentimentData.value || {}
+  const sectors = sectorData.value || []
+  const items = []
+  const sources = new Set()
+
+  const shChg = parseFloat(d.shIndex?.change || 0)
+  const szChg = parseFloat(d.szIndex?.change || 0)
+  const cyChg = parseFloat(d.cyIndex?.change || 0)
+  const chgs = [shChg, szChg, cyChg]
+  const allDown = chgs.every(v => v < 0)
+  const allUp = chgs.every(v => v > 0)
+
+  // === 1. 指数系统性风险（来源：东方财富/akshare 指数行情） ===
+  if (allDown) {
+    const worst = Math.min(shChg, szChg, cyChg)
+    const worstName = worst === cyChg ? '创业板' : worst === szChg ? '深证' : '上证'
+    if (worst < -2) {
+      items.push({
+        level: 'high',
+        text: `三大指数全线下跌，${worstName}${worst.toFixed(2)}%跌幅最大，系统性风险升温`,
+        source: '指数行情：东方财富/akshare',
+      })
+      sources.add('指数行情：东方财富/akshare')
+    } else {
+      items.push({
+        level: 'medium',
+        text: `上证${shChg.toFixed(2)}%、深证${szChg.toFixed(2)}%、创业板${cyChg.toFixed(2)}%齐跌，市场承压`,
+        source: '指数行情：东方财富/akshare',
+      })
+      sources.add('指数行情：东方财富/akshare')
+    }
+  } else {
+    // 指数分化
+    const maxChg = Math.max(...chgs)
+    const minChg = Math.min(...chgs)
+    if (maxChg - minChg > 2) {
+      const upName = maxChg === shChg ? '上证' : maxChg === szChg ? '深证' : '创业板'
+      const downName = minChg === shChg ? '上证' : minChg === szChg ? '深证' : '创业板'
+      items.push({
+        level: 'medium',
+        text: `指数分化：${upName}+${maxChg.toFixed(2)}% vs ${downName}${minChg.toFixed(2)}%，风格切换风险`,
+        source: '指数行情：东方财富/akshare',
+      })
+      sources.add('指数行情：东方财富/akshare')
+    }
+  }
+
+  // === 2. 涨跌广度风险（来源：akshare 全市场行情） ===
+  const upCount = d.upCount || s.upCount || 0
+  const downCount = d.downCount || s.downCount || 0
+  const total = upCount + downCount || 1
+  const downRatio = (downCount / total * 100).toFixed(1)
+
+  if (downCount > upCount * 2) {
+    items.push({
+      level: 'high',
+      text: `全市场${downCount}跌${upCount}涨（下跌占比${downRatio}%），亏钱效应显著`,
+      source: '涨跌统计：akshare 全市场行情',
+    })
+    sources.add('涨跌统计：akshare 全市场行情')
+  } else if (downCount > upCount * 1.3) {
+    items.push({
+      level: 'medium',
+      text: `跌多涨少：${downCount}跌${upCount}涨（下跌占比${downRatio}%），情绪偏弱`,
+      source: '涨跌统计：akshare 全市场行情',
+    })
+    sources.add('涨跌统计：akshare 全市场行情')
+  }
+
+  // === 3. 涨跌停风险（来源：akshare 涨跌停/炸板统计） ===
+  const lu = s.limitUpCount || d.limitUpCount || 0
+  const ld = s.limitDownCount || d.limitDownCount || 0
+  const bomb = s.bombCount || 0
+  const bombRate = lu + bomb > 0 ? (bomb / (lu + bomb) * 100) : 0
+
+  if (ld > lu && ld > 10) {
+    items.push({
+      level: 'high',
+      text: `跌停${ld}家 > 涨停${lu}家，做空情绪升温，规避高位题材`,
+      source: '涨跌停：akshare 涨跌停统计',
+    })
+    sources.add('涨跌停：akshare 涨跌停统计')
+  } else if (bombRate > 40 && lu > 0) {
+    items.push({
+      level: 'medium',
+      text: `炸板率${bombRate.toFixed(0)}%（炸板${bomb}家/封板${lu}家），追涨停风险加大`,
+      source: '涨跌停：akshare 炸板统计',
+    })
+    sources.add('涨跌停：akshare 炸板统计')
+  } else if (lu > 50) {
+    items.push({
+      level: 'low',
+      text: `涨停${lu}家偏多，注意高位股分歧后的退潮风险`,
+      source: '涨跌停：akshare 涨跌停统计',
+    })
+    sources.add('涨跌停：akshare 涨跌停统计')
+  }
+
+  // === 4. 板块分化风险（来源：东方财富行业板块行情） ===
+  if (sectors.length > 0) {
+    const sorted = [...sectors].sort((a, b) => parseFloat(b.avgChange) - parseFloat(a.avgChange))
+    const topSector = sorted[0]
+    const bottomSector = sorted[sorted.length - 1]
+    const topChg = parseFloat(topSector.avgChange)
+    const bottomChg = parseFloat(bottomSector.avgChange)
+    const downSectors = sorted.filter(s => parseFloat(s.avgChange) < 0).length
+
+    if (topChg - bottomChg > 5) {
+      items.push({
+        level: 'medium',
+        text: `板块分化严重：${topSector.name}+${topChg.toFixed(2)}% vs ${bottomSector.name}${bottomChg.toFixed(2)}%，资金分歧加大`,
+        source: '板块行情：东方财富行业板块',
+      })
+      sources.add('板块行情：东方财富行业板块')
+    }
+
+    if (downSectors > sectors.length * 0.8) {
+      items.push({
+        level: 'high',
+        text: `全行业普跌：${downSectors}/${sectors.length}个板块下跌，避险情绪升温`,
+        source: '板块行情：东方财富行业板块',
+      })
+      sources.add('板块行情：东方财富行业板块')
+    }
+  }
+
+  // === 5. 无风险时给出正常提示（仍引用数据） ===
+  if (items.length === 0) {
+    if (allUp && parseFloat(downRatio) < 40) {
+      items.push({
+        level: 'low',
+        text: `市场情绪偏暖：上证+${shChg.toFixed(2)}%，上涨${upCount}家占比${(100 - parseFloat(downRatio)).toFixed(1)}%，关注主线持续性`,
+        source: '指数行情+涨跌统计：东方财富/akshare',
+      })
+      sources.add('指数行情+涨跌统计：东方财富/akshare')
+    } else {
+      items.push({
+        level: 'low',
+        text: `市场多空均衡：${upCount}涨${downCount}跌，涨停${lu}家跌停${ld}家，关注量能配合`,
+        source: '涨跌统计+涨跌停：akshare',
+      })
+      sources.add('涨跌统计+涨跌停：akshare')
+    }
+  }
+
+  dataSources.value = [...sources]
+  return items
 })
 
-// 根据市场数据动态生成风险提示
-const riskWarnings = computed(() => {
-  if (!sentiment.value) return []
-  const {
-    limitUpCount = 0,
-    upCount = 0,
-    downCount = 0,
-    bombCount = 0,
-  } = sentiment.value
-  const warnings = []
-
-  // 涨停数 > 30
-  if (limitUpCount > 30) {
-    warnings.push('涨停家数较多，注意高位股分歧风险')
-  }
-  // 下跌家数 > 上涨家数 * 1.5
-  if (upCount > 0 && downCount > upCount * 1.5) {
-    warnings.push('跌多涨少，市场情绪偏弱，控制仓位')
-  }
-  // 炸板率 > 30%
-  if (bombRate.value > 30) {
-    warnings.push(`炸板率较高(${bombRate.value.toFixed(0)}%)，追涨停风险加大`)
-  }
-  // 默认提示
-  if (warnings.length === 0) {
-    warnings.push('市场情绪正常，关注主线板块持续性')
-  }
-  return warnings
-})
-
-// 风险等级（用于图标颜色提示）
+// 综合风险等级
 const riskLevel = computed(() => {
-  if (!sentiment.value) return 'normal'
-  const { limitUpCount = 0, upCount = 0, downCount = 0 } = sentiment.value
-  let score = 0
-  if (limitUpCount > 30) score++
-  if (upCount > 0 && downCount > upCount * 1.5) score++
-  if (bombRate.value > 30) score++
-  if (score >= 2) return 'high'
-  if (score === 1) return 'medium'
+  const items = riskItems.value
+  if (items.length === 0) return 'normal'
+  const highCount = items.filter(i => i.level === 'high').length
+  const mediumCount = items.filter(i => i.level === 'medium').length
+  if (highCount >= 2) return 'high'
+  if (highCount >= 1 || mediumCount >= 2) return 'medium'
   return 'normal'
 })
 
@@ -80,7 +210,7 @@ onMounted(() => {
 </script>
 
 <template>
-  <div class="risk-warning">
+  <div class="risk-warning" :class="riskLevel">
     <!-- 加载状态 -->
     <div v-if="loading" class="state-box">
       <div class="mini-spinner"></div>
@@ -90,7 +220,7 @@ onMounted(() => {
     <!-- 错误状态 -->
     <div v-else-if="error" class="state-box">
       <span class="state-text error-text">{{ error }}</span>
-      <button class="retry-btn" @click="loadData">重试</button>
+      <button class="retry-btn" @click="retry">重试</button>
     </div>
 
     <!-- 风险内容 -->
@@ -112,13 +242,27 @@ onMounted(() => {
             {{ riskLevel === 'high' ? '高风险' : riskLevel === 'medium' ? '中风险' : '正常' }}
           </span>
         </div>
+
+        <!-- 数据驱动型风险提示列表 -->
         <div class="warning-list">
-          <p v-for="(w, i) in riskWarnings" :key="i" class="warning-item">
-            <span class="warning-bullet"></span>
-            <span class="warning-text">{{ w }}</span>
-          </p>
+          <div v-for="(item, i) in riskItems" :key="i" class="warning-item" :class="item.level">
+            <span class="warning-bullet" :class="item.level"></span>
+            <div class="warning-body">
+              <span class="warning-text">{{ item.text }}</span>
+              <span class="warning-source">{{ item.source }}</span>
+            </div>
+          </div>
         </div>
-        <p class="disclaimer">数据来源：akshare 全市场行情 · 涨跌停/炸板统计 · 以上分析仅供参考，不构成投资建议</p>
+
+        <!-- 分析依据来源 -->
+        <div class="sources-section" v-if="dataSources.length">
+          <div class="source-label">分析依据</div>
+          <div class="source-tags">
+            <span v-for="src in dataSources" :key="src" class="source-tag">{{ src }}</span>
+          </div>
+        </div>
+
+        <p class="disclaimer">数据更新于 {{ updateTime }} · 以上分析仅供参考，不构成投资建议</p>
       </div>
     </div>
   </div>
@@ -132,8 +276,16 @@ onMounted(() => {
   padding: 14px;
   overflow: hidden;
 }
+.risk-warning.medium {
+  background: rgba(249, 115, 22, 0.06);
+  border-color: rgba(249, 115, 22, 0.25);
+}
+.risk-warning.normal {
+  background: rgba(34, 197, 94, 0.04);
+  border-color: rgba(34, 197, 94, 0.2);
+}
 
-/* 状态盒子（加载/错误） */
+/* 状态盒子 */
 .state-box {
   display: flex;
   flex-direction: column;
@@ -205,8 +357,8 @@ onMounted(() => {
   color: var(--color-orange);
 }
 .risk-icon.normal {
-  background: rgba(139, 148, 158, 0.12);
-  color: var(--color-text-tertiary);
+  background: rgba(34, 197, 94, 0.12);
+  color: var(--color-green);
 }
 @keyframes pulse-icon {
   0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.3); }
@@ -233,6 +385,9 @@ onMounted(() => {
   margin: 0;
   letter-spacing: -0.01em;
 }
+.risk-warning.medium .risk-title { color: var(--color-orange); }
+.risk-warning.normal .risk-title { color: var(--color-green); }
+
 .level-tag {
   display: inline-flex;
   align-items: center;
@@ -259,7 +414,7 @@ onMounted(() => {
 .warning-list {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 6px;
 }
 .warning-item {
   display: flex;
@@ -268,18 +423,63 @@ onMounted(() => {
   margin: 0;
 }
 .warning-bullet {
-  width: 4px;
-  height: 4px;
+  width: 6px;
+  height: 6px;
   border-radius: 50%;
-  background: var(--color-orange);
   flex-shrink: 0;
-  margin-top: 7px;
+  margin-top: 6px;
+}
+.warning-bullet.high { background: var(--color-red); box-shadow: 0 0 6px rgba(239, 68, 68, 0.4); }
+.warning-bullet.medium { background: var(--color-orange); }
+.warning-bullet.low { background: var(--color-green); }
+
+.warning-body {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
 }
 .warning-text {
   font-size: 12px;
   line-height: 1.5;
   color: var(--color-text-secondary);
   font-variant-numeric: tabular-nums;
+}
+.warning-source {
+  font-size: 9px;
+  color: var(--color-text-quaternary, #6e7681);
+  font-weight: 500;
+}
+
+/* 分析依据来源 */
+.sources-section {
+  margin-top: 4px;
+  padding: 6px 8px;
+  background: rgba(255, 255, 255, 0.03);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-separator);
+}
+.source-label {
+  font-size: 9px;
+  font-weight: 700;
+  color: var(--color-text-tertiary);
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  margin-bottom: 4px;
+}
+.source-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.source-tag {
+  font-size: 9px;
+  font-weight: 600;
+  color: var(--color-text-tertiary);
+  background: var(--color-surface);
+  padding: 2px 7px;
+  border-radius: var(--radius-full);
+  border: 1px solid var(--color-separator);
 }
 
 /* 底部免责声明 */
