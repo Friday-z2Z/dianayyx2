@@ -164,31 +164,35 @@ const getWeatherFromOpenMeteo = async (cityName) => {
     `&daily=temperature_2m_max,temperature_2m_min` +
     `&timezone=Asia/Shanghai`
 
-  // 尝试直连，失败则通过 CORS 代理
-  const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`
+  // 多源容错：直连 → 3 个 CORS 代理依次尝试
+  const PROXIES = [
+    (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
+    (u) => `https://api.codetabs.com/v1/proxy/?quest=${u}`,
+    (u) => `https://corsproxy.io/?url=${encodeURIComponent(u)}`,
+  ]
   let json = null
 
   // 1. 直连
   try {
     const controller = new AbortController()
-    const timeoutId = setTimeout(() => controller.abort(), 15000)
+    const timeoutId = setTimeout(() => controller.abort(), 12000)
     const response = await fetch(url, { signal: controller.signal })
     clearTimeout(timeoutId)
     if (response.ok) json = await response.json()
   } catch (e) {
-    console.warn('[WeatherService] Open-Meteo 直连失败，尝试代理:', e.message)
+    console.warn('[WeatherService] Open-Meteo 直连失败，尝试 CORS 代理:', e.message)
   }
 
-  // 2. CORS 代理降级
-  if (!json) {
+  // 2. 依次尝试 CORS 代理
+  for (let i = 0; i < PROXIES.length && !json; i++) {
     try {
       const controller = new AbortController()
-      const timeoutId = setTimeout(() => controller.abort(), 20000)
-      const response = await fetch(proxyUrl, { signal: controller.signal })
+      const timeoutId = setTimeout(() => controller.abort(), 18000)
+      const response = await fetch(PROXIES[i](url), { signal: controller.signal })
       clearTimeout(timeoutId)
       if (response.ok) json = await response.json()
     } catch (e) {
-      console.warn('[WeatherService] Open-Meteo 代理也失败:', e.message)
+      console.warn(`[WeatherService] CORS 代理 ${i} 失败:`, e.message)
     }
   }
 

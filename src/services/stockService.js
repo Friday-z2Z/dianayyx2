@@ -59,7 +59,7 @@ const _fetchWithFallback = async (targetUrl, timeout = 10000) => {
     }
   }
 
-  // 静态模式：已知可用方式直接使用
+  // 静态模式：已知可用方式直接使用（_workingProxyIdx !== null 时才走缓存路径）
   if (_workingProxyIdx === -1) {
     const controller = new AbortController()
     const timeoutId = setTimeout(() => controller.abort(), timeout)
@@ -72,7 +72,7 @@ const _fetchWithFallback = async (targetUrl, timeout = 10000) => {
       clearTimeout(timeoutId)
       _workingProxyIdx = null  // 直连失败，重新探测
     }
-  } else if (_workingProxyIdx >= 0) {
+  } else if (_workingProxyIdx !== null && _workingProxyIdx >= 0) {
     const proxy = CORS_PROXIES[_workingProxyIdx]
     const proxyUrl = proxy.build(targetUrl)
     const controller = new AbortController()
