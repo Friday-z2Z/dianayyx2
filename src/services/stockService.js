@@ -7,8 +7,12 @@
 
 // ==================== API 基地址配置 ====================
 // 开发模式 / 本地 Flask 部署：使用相对路径（Vite proxy 或 Flask 代理）
-// GitHub Pages 部署：通过 VITE_API_BASE 环境变量指向远程后端
+// GitHub Pages 部署（无后端）：IS_STATIC=true，直接调用支持 CORS 的东方财富 API
+// GitHub Pages 部署（有后端）：通过 VITE_API_BASE 环境变量指向远程后端
 const API_BASE = import.meta.env.VITE_API_BASE || ''
+
+// 静态模式：生产构建且未配置后端地址时，直连支持 CORS 的公开 API
+const IS_STATIC = !API_BASE && import.meta.env.PROD
 
 // ==================== 状态管理 ====================
 let _cachedStockData = null
@@ -18,8 +22,9 @@ const MARKET_STATS_TTL = 30000  // 市场统计缓存 30 秒
 
 // ==================== 东方财富 API 基础配置 ====================
 // 双通道：直连代理（主）+ 后端代理（备）
-const EM_DIRECT = `${API_BASE}/api/eastmoney`
-const EM_BACKEND = `${API_BASE}/api/akshare/em_api`
+// 静态模式下直连东方财富 API（支持 CORS），开发/部署模式下通过代理
+const EM_DIRECT = IS_STATIC ? 'https://push2delay.eastmoney.com' : `${API_BASE}/api/eastmoney`
+const EM_BACKEND = IS_STATIC ? '' : `${API_BASE}/api/akshare/em_api`
 const EM_UT = 'bd1d9ddb04089700cf9c27f6f7426281'
 
 /**
@@ -41,6 +46,8 @@ const _emFetch = async (apiPath, apiName, params, timeout = 10000) => {
     return await response.json()
   } catch (error) {
     clearTimeout(timeoutId)
+    // 静态模式无后端代理，直接抛出错误
+    if (IS_STATIC) throw error
     // 降级：后端代理
     const backendUrl = `${EM_BACKEND}?${new URLSearchParams({ ...params, _api: apiName }).toString()}`
     const controller2 = new AbortController()
@@ -259,6 +266,11 @@ let _akshareCheckTime = 0
 const AKSHARE_RECHECK_INTERVAL = 60000  // 60 秒后允许重新检查
 
 const checkAkshareAvailable = async () => {
+  // 静态模式（GitHub Pages 无后端）直接返回不可用
+  if (IS_STATIC) {
+    _akshareAvailable = false
+    return false
+  }
   // 60 秒内使用缓存结果，超过则重新检查
   if (_akshareAvailable !== null && Date.now() - _akshareCheckTime < AKSHARE_RECHECK_INTERVAL) {
     return _akshareAvailable
@@ -752,6 +764,9 @@ const fetchNewsFromEastMoney = async () => {
  * 降级：东方财富 7x24 全球财经快讯 API
  */
 export const getFinancialNews = async () => {
+  // 静态模式无后端，东方财富新闻 API 不支持 CORS，跳过
+  if (IS_STATIC) return []
+
   // 优先 akshare 后端
   try {
     const data = await fetchFromAkshare('/news', 15000)

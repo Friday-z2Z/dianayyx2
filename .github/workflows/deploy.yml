@@ -29,10 +29,13 @@ jobs:
           node-version: 24
           cache: pnpm
 
-      - name: Install and Build   # 安装依赖、打包，注入远程 API 地址
+      - name: Install and Build   # 安装依赖、打包
         env:
-          # GitHub Pages 部署时，API 请求需指向远程 Flask 后端
-          # 修改为你的服务器地址，如 https://api.example.com
+          # 部署模式说明：
+          # 1. 静态模式（默认）：不设置 VITE_API_BASE secret，前端直连东方财富 API + Open-Meteo 天气 API
+          #    适用于无需后端的纯静态部署，推送代码即自动构建部署
+          # 2. 完整模式：设置 VITE_API_BASE secret 为远程后端地址（如 https://your-server.com）
+          #    启用全部功能（融资数据、IPO日历、财经新闻等需后端支持）
           VITE_API_BASE: ${{ secrets.VITE_API_BASE }}
         run: |
           pnpm install
