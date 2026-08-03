@@ -1,16 +1,11 @@
 /**
- * 天气数据服务 v2
- * 数据源：t.weather.itboy.net（免费无需API Key）
+ * 天气数据服务 - 纯前端版
+ * 数据源：Open-Meteo API（支持 CORS + HTTPS，免费无需 API Key）
  * 仅展示当天天气，自动获取定位城市（失败则默认杭州）
+ * 容错方案：直连失败自动切换公共 CORS 代理
  */
 
-// API 基地址：开发/本地用相对路径，GitHub Pages 用远程后端
-const API_BASE = import.meta.env.VITE_API_BASE || ''
-
-// 静态模式：生产构建且无后端时，使用 Open-Meteo API（支持 CORS + HTTPS）
-const IS_STATIC = !API_BASE && import.meta.env.PROD
-
-// 中国主要城市代码
+// 中国主要城市代码（用于城市名验证）
 const CITIES = {
   '杭州': { code: '101210101', name: '杭州' },
   '北京': { code: '101010100', name: '北京' },
@@ -49,7 +44,7 @@ const CITIES = {
   '乌鲁木齐': { code: '101130101', name: '乌鲁木齐' },
 }
 
-// 天气类型图标映射
+// 天气类型图标映射（降级数据用）
 const WEATHER_ICON_MAP = {
   '晴': { icon: '☀️', bg: 'sunny' },
   '多云': { icon: '⛅', bg: 'partly-cloudy' },
@@ -74,7 +69,7 @@ const WEATHER_ICON_MAP = {
 
 const getWeatherIcon = (type) => WEATHER_ICON_MAP[type] || { icon: '🌤️', bg: 'partly-cloudy' }
 
-// ==================== Open-Meteo 静态模式配置 ====================
+// ==================== Open-Meteo 配置 ====================
 
 // 中国主要城市经纬度（用于 Open-Meteo API）
 const CITY_COORDS = {
@@ -152,8 +147,15 @@ const getWindDir = (deg) => {
   return dirs[Math.round(deg / 45) % 8]
 }
 
+// CORS 代理容错列表（Open-Meteo 已支持 CORS，代理仅作为降级备份）
+const CORS_PROXIES = [
+  (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
+  (u) => `https://api.codetabs.com/v1/proxy/?quest=${u}`,
+  (u) => `https://corsproxy.io/?url=${encodeURIComponent(u)}`,
+]
+
 /**
- * 从 Open-Meteo 获取天气（静态模式专用，支持 CORS + HTTPS）
+ * 从 Open-Meteo 获取天气（支持 CORS + HTTPS）
  * 直连失败时通过 CORS 代理降级
  */
 const getWeatherFromOpenMeteo = async (cityName) => {
@@ -164,15 +166,9 @@ const getWeatherFromOpenMeteo = async (cityName) => {
     `&daily=temperature_2m_max,temperature_2m_min` +
     `&timezone=Asia/Shanghai`
 
-  // 多源容错：直连 → 3 个 CORS 代理依次尝试
-  const PROXIES = [
-    (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
-    (u) => `https://api.codetabs.com/v1/proxy/?quest=${u}`,
-    (u) => `https://corsproxy.io/?url=${encodeURIComponent(u)}`,
-  ]
   let json = null
 
-  // 1. 直连
+  // 1. 直连（Open-Meteo 原生支持 CORS）
   try {
     const controller = new AbortController()
     const timeoutId = setTimeout(() => controller.abort(), 12000)
@@ -184,11 +180,11 @@ const getWeatherFromOpenMeteo = async (cityName) => {
   }
 
   // 2. 依次尝试 CORS 代理
-  for (let i = 0; i < PROXIES.length && !json; i++) {
+  for (let i = 0; i < CORS_PROXIES.length && !json; i++) {
     try {
       const controller = new AbortController()
       const timeoutId = setTimeout(() => controller.abort(), 18000)
-      const response = await fetch(PROXIES[i](url), { signal: controller.signal })
+      const response = await fetch(CORS_PROXIES[i](url), { signal: controller.signal })
       clearTimeout(timeoutId)
       if (response.ok) json = await response.json()
     } catch (e) {
@@ -236,16 +232,6 @@ const getWeatherFromOpenMeteo = async (cityName) => {
     console.warn('[WeatherService] Open-Meteo 数据解析失败:', error.message)
     return getFallbackWeather(cityName)
   }
-}
-
-const getWindLevel = (fl) => {
-  const m = { '<3级':2,'1级':1,'2级':2,'3级':3,'3-4级':3,'4级':4,'4-5级':4,'5级':5,'5-6级':5,'6级':6,'7级':7,'8级':7,'9级':8,'10级':9,'11级':10,'12级':11 }
-  return m[fl] || 2
-}
-
-const parseTemp = (str) => {
-  const match = String(str).match(/(\d+)/)
-  return match ? parseInt(match[1]) : 0
 }
 
 // ==================== 定位逻辑 ====================
@@ -306,62 +292,11 @@ export const detectCity = async () => {
 
 /**
  * 获取当天实时天气（仅今天）
+ * 纯前端模式：直连 Open-Meteo API，失败降级为模拟数据
  */
 export const getCurrentWeather = async (cityName = '杭州') => {
-  const city = CITIES[cityName] || CITIES['杭州']
-  const actualCity = city === CITIES[cityName] ? cityName : '杭州'
-
-  // 静态模式（GitHub Pages 无后端）：使用 Open-Meteo API（支持 CORS + HTTPS）
-  if (IS_STATIC) {
-    return getWeatherFromOpenMeteo(actualCity)
-  }
-
-  let timeoutId = null
-  try {
-    const baseUrl = `${API_BASE}/api/weather`
-    const url = `${baseUrl}/city/${city.code}`
-
-    const controller = new AbortController()
-    timeoutId = setTimeout(() => controller.abort(), 8000)
-
-    const response = await fetch(url, { signal: controller.signal })
-    clearTimeout(timeoutId)
-
-    if (!response.ok) throw new Error(`HTTP ${response.status}`)
-    const json = await response.json()
-
-    if (json.status !== 200 || !json.data) {
-      throw new Error(json.message || '天气API返回数据异常')
-    }
-
-    const data = json.data
-    const today = data.forecast[0]
-    const weatherInfo = getWeatherIcon(today.type)
-
-    return {
-      city: json.cityInfo.city.replace('市', ''),
-      temperature: Math.round(parseFloat(data.wendu)),
-      feelsLike: Math.round(parseFloat(data.wendu) - 2),
-      humidity: parseInt(data.shidu),
-      weatherDesc: today.type,
-      weatherIcon: weatherInfo.icon,
-      weatherBg: weatherInfo.bg,
-      windSpeed: getWindLevel(today.fl) * 5,
-      windDirection: today.fx,
-      updateTime: json.time?.split(' ')[1]?.slice(0, 5) || '--:--',
-      aqi: data.forecast[0].aqi,
-      quality: data.quality,
-      pm25: data.pm25,
-      pm10: data.pm10,
-      high: parseTemp(today.high),
-      low: parseTemp(today.low),
-      notice: today.notice,
-    }
-  } catch (error) {
-    if (timeoutId) clearTimeout(timeoutId)
-    console.warn('[WeatherService] 天气API请求失败:', error.message)
-    return getFallbackWeather(actualCity)
-  }
+  const actualCity = CITIES[cityName] ? cityName : '杭州'
+  return getWeatherFromOpenMeteo(actualCity)
 }
 
 // 降级模拟数据

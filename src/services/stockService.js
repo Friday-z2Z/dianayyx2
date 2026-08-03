@@ -1,35 +1,13 @@
 /**
- * 股票数据服务 - 商业级
- * 数据源：akshare 后端服务（全市场实时行情）
- * 降级方案：东方财富直连API（通过 Vite 代理）
- * 不再使用预设股票池，所有数据均来自实时接口
+ * 股票数据服务 - 纯前端版
+ * 数据源：东方财富公开 API（push2delay / push2his / datacenter-web / np-weblist）
+ * 汇率数据：open.er-api.com（支持 CORS）
+ * 容错方案：直连失败自动切换公共 CORS 代理（allorigins / codetabs / corsproxy）
+ * 无需后端服务器，所有请求由浏览器直接发起
  */
 
-// ==================== API 基地址配置 ====================
-// 开发模式 / 本地 Flask 部署：使用相对路径（Vite proxy 或 Flask 代理）
-// GitHub Pages 部署（无后端）：IS_STATIC=true，直接调用支持 CORS 的东方财富 API
-// GitHub Pages 部署（有后端）：通过 VITE_API_BASE 环境变量指向远程后端
-const API_BASE = import.meta.env.VITE_API_BASE || ''
-
-// 静态模式：生产构建且未配置后端地址时，直连支持 CORS 的公开 API
-const IS_STATIC = !API_BASE && import.meta.env.PROD
-
-// ==================== 状态管理 ====================
-let _cachedStockData = null
-let _cachedMarketStats = null
-let _cachedMarketStatsTime = 0
-const MARKET_STATS_TTL = 30000  // 市场统计缓存 30 秒
-
-// ==================== 东方财富 API 基础配置 ====================
-// 双通道：直连代理（主）+ 后端代理（备）
-// 静态模式下直连东方财富 API（支持 CORS），开发/部署模式下通过代理
-const EM_DIRECT = IS_STATIC ? 'https://push2delay.eastmoney.com' : `${API_BASE}/api/eastmoney`
-const EM_BACKEND = IS_STATIC ? '' : `${API_BASE}/api/akshare/em_api`
-const EM_UT = 'bd1d9ddb04089700cf9c27f6f7426281'
-
-// ==================== 静态模式 CORS 代理容错 ====================
-// GitHub Pages (HTTPS) 直连东方财富 API 可能因网络环境被关闭连接
-// 公共 CORS 代理作为降级方案，按顺序尝试直到成功
+// ==================== CORS 代理容错 ====================
+// 部分东方财富 API 不支持 CORS，直连失败时依次尝试公共代理
 const CORS_PROXIES = [
   { name: 'allorigins', build: (url) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}` },
   { name: 'codetabs',   build: (url) => `https://api.codetabs.com/v1/proxy/?quest=${url}` },
@@ -37,29 +15,14 @@ const CORS_PROXIES = [
 ]
 
 // 缓存可用代理（-1 = 直连，0+ = CORS_PROXIES 索引），避免每次都尝试全部
-let _workingProxyIdx = null  // null = 未测试，-1 = 直连可用，0+ = 代理索引
+let _workingProxyIdx = null
 
 /**
- * 带容错的 fetch：静态模式下先直连，失败则依次尝试 CORS 代理
- * 非静态模式直接请求（由 Vite/Flask 代理）
+ * 带容错的 fetch：先直连，失败则依次尝试 CORS 代理
+ * 适用于所有第三方 API（东方财富、er-api 等）
  */
-const _fetchWithFallback = async (targetUrl, timeout = 10000) => {
-  // 非静态模式：直接请求
-  if (!IS_STATIC) {
-    const controller = new AbortController()
-    const timeoutId = setTimeout(() => controller.abort(), timeout)
-    try {
-      const response = await fetch(targetUrl, { signal: controller.signal, headers: { 'Accept': 'application/json' } })
-      clearTimeout(timeoutId)
-      if (!response.ok) throw new Error(`HTTP ${response.status}`)
-      return await response.json()
-    } catch (e) {
-      clearTimeout(timeoutId)
-      throw e
-    }
-  }
-
-  // 静态模式：已知可用方式直接使用（_workingProxyIdx !== null 时才走缓存路径）
+const fetchWithFallback = async (targetUrl, timeout = 10000) => {
+  // 已知可用方式直接使用
   if (_workingProxyIdx === -1) {
     const controller = new AbortController()
     const timeoutId = setTimeout(() => controller.abort(), timeout)
@@ -70,7 +33,7 @@ const _fetchWithFallback = async (targetUrl, timeout = 10000) => {
       return await response.json()
     } catch (e) {
       clearTimeout(timeoutId)
-      _workingProxyIdx = null  // 直连失败，重新探测
+      _workingProxyIdx = null
     }
   } else if (_workingProxyIdx !== null && _workingProxyIdx >= 0) {
     const proxy = CORS_PROXIES[_workingProxyIdx]
@@ -84,12 +47,11 @@ const _fetchWithFallback = async (targetUrl, timeout = 10000) => {
       return await response.json()
     } catch (e) {
       clearTimeout(timeoutId)
-      _workingProxyIdx = null  // 代理失败，重新探测
+      _workingProxyIdx = null
     }
   }
 
   // 探测阶段：先试直连，再试代理
-  // 1. 直连
   try {
     const controller = new AbortController()
     const timeoutId = setTimeout(() => controller.abort(), timeout)
@@ -97,14 +59,12 @@ const _fetchWithFallback = async (targetUrl, timeout = 10000) => {
     clearTimeout(timeoutId)
     if (response.ok) {
       _workingProxyIdx = -1
-      console.log('[StockService] 静态模式：直连东方财富 API 成功')
       return await response.json()
     }
   } catch (e) {
-    console.warn('[StockService] 直连失败，尝试 CORS 代理:', e.message)
+    // 直连失败，继续尝试代理
   }
 
-  // 2. 依次尝试 CORS 代理
   for (let i = 0; i < CORS_PROXIES.length; i++) {
     const proxy = CORS_PROXIES[i]
     const proxyUrl = proxy.build(targetUrl)
@@ -115,70 +75,160 @@ const _fetchWithFallback = async (targetUrl, timeout = 10000) => {
       clearTimeout(timeoutId)
       if (response.ok) {
         _workingProxyIdx = i
-        console.log(`[StockService] 静态模式：CORS 代理 ${proxy.name} 可用`)
+        console.log(`[StockService] CORS 代理 ${proxy.name} 可用`)
         return await response.json()
       }
     } catch (e) {
       clearTimeout(timeoutId)
-      console.warn(`[StockService] CORS 代理 ${proxy.name} 失败:`, e.message)
     }
   }
 
   throw new Error('所有数据源均不可用（直连 + 3 个 CORS 代理）')
 }
 
-/**
- * 通用东方财富 API 请求（双通道容错）
- * 优先 Vite 直连代理，失败降级到后端代理
- */
-const _emFetch = async (apiPath, apiName, params, timeout = 10000) => {
-  const qs = new URLSearchParams(params).toString()
-  const directUrl = `${EM_DIRECT}${apiPath}?${qs}`
+// ==================== 东方财富 API 配置 ====================
+const EM_UT = 'bd1d9ddb04089700cf9c27f6f7426281'
+const EM_PUSH2 = 'https://push2delay.eastmoney.com'
+const EM_PUSH2HIS = 'https://push2his.eastmoney.com'
+const EM_DATACENTER = 'https://datacenter-web.eastmoney.com/api/data/v1/get'
+const EM_NEWS_URL = 'https://np-weblist.eastmoney.com/comm/web/getFastNewsList'
 
-  // 静态模式：使用带 CORS 代理容错的 fetch
-  if (IS_STATIC) {
-    return _fetchWithFallback(directUrl, timeout)
-  }
+// ==================== 状态管理 ====================
+let _cachedStockData = null
+let _cachedMarketStats = null
+let _cachedMarketStatsTime = 0
+const MARKET_STATS_TTL = 30000
 
-  // 开发/部署模式：直连 + 后端代理降级
-  const controller = new AbortController()
-  const timeoutId = setTimeout(() => controller.abort(), timeout)
-  try {
-    const response = await fetch(directUrl, {
-      signal: controller.signal,
-      headers: { 'Accept': 'application/json' }
-    })
-    clearTimeout(timeoutId)
-    if (!response.ok) throw new Error(`EM HTTP ${response.status}`)
-    return await response.json()
-  } catch (error) {
-    clearTimeout(timeoutId)
-    // 降级：后端代理
-    const backendUrl = `${EM_BACKEND}?${new URLSearchParams({ ...params, _api: apiName }).toString()}`
-    const controller2 = new AbortController()
-    const timeoutId2 = setTimeout(() => controller2.abort(), timeout)
-    try {
-      const response = await fetch(backendUrl, {
-        signal: controller2.signal,
-        headers: { 'Accept': 'application/json' }
-      })
-      clearTimeout(timeoutId2)
-      if (!response.ok) throw new Error(`EM backend HTTP ${response.status}`)
-      return await response.json()
-    } catch (error2) {
-      clearTimeout(timeoutId2)
-      throw error2
-    }
-  }
+// 慢速接口缓存
+const _slowCache = {}
+const _slowCacheTime = {}
+const SLOW_CACHE_TTL = {
+  financing: 300000,      // 5 分钟
+  ipo: 3600000,           // 1 小时
+  lockup: 3600000,        // 1 小时
+  earnings: 3600000,      // 1 小时
+  exchangeRates: 600000,  // 10 分钟
+  northbound: 300000,     // 5 分钟
+  news: 120000,           // 2 分钟
 }
 
+const getSlowCache = (key) => {
+  const ttl = SLOW_CACHE_TTL[key] || 300000
+  if (_slowCache[key] && Date.now() - _slowCacheTime[key] < ttl) return _slowCache[key]
+  return null
+}
+const setSlowCache = (key, data) => {
+  _slowCache[key] = data
+  _slowCacheTime[key] = Date.now()
+}
+
+// ==================== 通用请求函数 ====================
+
 /**
- * 通用东方财富 clist API 请求
+ * 请求东方财富 push2 clist API
  */
 const fetchFromEastMoney = async (params, timeout = 10000) => {
-  const json = await _emFetch('/api/qt/clist/get', 'clist', params, timeout)
+  const qs = new URLSearchParams(params).toString()
+  const url = `${EM_PUSH2}/api/qt/clist/get?${qs}`
+  const json = await fetchWithFallback(url, timeout)
   return json.data?.diff || []
 }
+
+/**
+ * 请求东方财富 push2 ulist API（指数）
+ */
+const fetchUlistFromEastMoney = async (params, timeout = 8000) => {
+  const qs = new URLSearchParams(params).toString()
+  const url = `${EM_PUSH2}/api/qt/ulist.np/get?${qs}`
+  const json = await fetchWithFallback(url, timeout)
+  return json
+}
+
+/**
+ * 请求东方财富 push2his kline API（K线）
+ */
+const fetchKlineFromEastMoney = async (secid, klt = 101, fqt = 1, beg, end, lmt = 120) => {
+  const params = new URLSearchParams({
+    secid, klt: String(klt), fqt: String(fqt), beg, end, lmt: String(lmt),
+    fields1: 'f1,f2,f3,f4,f5,f6',
+    fields2: 'f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61',
+  })
+  const url = `${EM_PUSH2HIS}/api/qt/stock/kline/get?${params}`
+  return await fetchWithFallback(url, 10000)
+}
+
+/**
+ * 请求东方财富 push2his trends2 API（分时）
+ */
+const fetchTrendsFromEastMoney = async (secid) => {
+  const params = new URLSearchParams({
+    secid, fields1: 'f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13',
+    fields2: 'f51,f52,f53,f54,f55,f56,f57,f58', iscr: '0', ndays: '1',
+  })
+  const url = `${EM_PUSH2HIS}/api/qt/stock/trends2/get?${params}`
+  return await fetchWithFallback(url, 10000)
+}
+
+/**
+ * 请求东方财富 datacenter API
+ */
+const fetchFromDatacenter = async (reportName, extraParams = {}, timeout = 15000) => {
+  const params = new URLSearchParams({
+    reportName, columns: 'ALL', source: 'WEB', pageSize: '20', pageNumber: '1',
+    ...extraParams,
+  })
+  const url = `${EM_DATACENTER}?${params}`
+  const json = await fetchWithFallback(url, timeout)
+  if (!json.success) throw new Error(json.message || 'datacenter 请求失败')
+  return json.result?.data || []
+}
+
+/**
+ * 请求东方财富新闻 API
+ */
+const fetchNewsFromEastMoney = async () => {
+  const params = new URLSearchParams({
+    client: 'web', biz: 'web_724', fastColumn: '102', sortEnd: '', pageSize: '20',
+    req_trace: String(Date.now()),
+  })
+  const url = `${EM_NEWS_URL}?${params}`
+  const json = await fetchWithFallback(url, 10000)
+  return json.data?.fastNewsList || []
+}
+
+// ==================== 格式化工具 ====================
+const formatVolume = (vol) => {
+  if (vol == null || vol === '-') return '--'
+  if (vol >= 100000000) return (vol / 100000000).toFixed(2) + '亿'
+  if (vol >= 10000) return (vol / 10000).toFixed(0) + '万'
+  return String(vol)
+}
+
+const formatMoney = (num) => {
+  if (num == null || num === '-') return '--'
+  if (num >= 100000000) return (num / 100000000).toFixed(2) + '亿'
+  if (num >= 10000) return (num / 10000).toFixed(0) + '万'
+  return num.toFixed(0)
+}
+
+const formatMarketCap = (num) => {
+  if (num == null) return '--'
+  if (num >= 1000000000000) return (num / 1000000000000).toFixed(2) + '万亿'
+  if (num >= 100000000) return (num / 100000000).toFixed(1) + '亿'
+  return num.toFixed(0) + '万'
+}
+
+/**
+ * 股票代码转 secid（东方财富格式）
+ * 沪市 6/9 开头 → 1.code，深市 0/3 开头 → 0.code，北交所 8/4 开头 → 0.code
+ */
+const codeToSecid = (code) => {
+  const c = String(code).padStart(6, '0')
+  if (c.startsWith('6') || c.startsWith('9')) return `1.${c}`
+  return `0.${c}`
+}
+
+// ==================== 数据源函数 ====================
 
 /**
  * 从东方财富获取全市场股票行情（按总市值降序，取前200）
@@ -187,7 +237,7 @@ const fetchStockListFromEastMoney = async () => {
   const items = await fetchFromEastMoney({
     pn: 1, pz: 200, po: 1, np: 1,
     ut: EM_UT, fltt: 2, invt: 2,
-    fid: 'f20',  // 按总市值排序
+    fid: 'f20',
     fs: 'm:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23,m:0 t:81 s:2048',
     fields: 'f2,f3,f4,f5,f6,f7,f8,f9,f12,f14,f15,f16,f17,f18,f20,f23',
   })
@@ -214,11 +264,10 @@ const fetchStockListFromEastMoney = async () => {
 }
 
 /**
- * 从东方财富获取全市场涨跌统计（获取全部股票的涨跌幅用于统计）
+ * 从东方财富获取全市场涨跌统计
  */
 const fetchMarketStatsFromEastMoney = async () => {
   if (_cachedMarketStats && Date.now() - _cachedMarketStatsTime < MARKET_STATS_TTL) return _cachedMarketStats
-  // 获取全部A股涨跌幅（只请求 f3 字段以减少数据量）
   const allItems = await fetchFromEastMoney({
     pn: 1, pz: 5500, po: 1, np: 1,
     ut: EM_UT, fltt: 2, invt: 2,
@@ -244,8 +293,8 @@ const fetchSectorDataFromEastMoney = async () => {
   const items = await fetchFromEastMoney({
     pn: 1, pz: 100, po: 1, np: 1,
     ut: EM_UT, fltt: 2, invt: 2,
-    fid: 'f3',  // 按涨跌幅排序
-    fs: 'm:90 t:2 f:!50',  // 行业板块
+    fid: 'f3',
+    fs: 'm:90 t:2 f:!50',
     fields: 'f2,f3,f4,f8,f12,f14,f104,f105,f128,f136,f140,f168',
   })
   const result = items.map(item => ({
@@ -259,7 +308,6 @@ const fetchSectorDataFromEastMoney = async () => {
     topStockChange: item.f136 != null ? item.f136.toFixed(2) : '0.00',
   }))
   result.sort((a, b) => parseFloat(b.avgChange) - parseFloat(a.avgChange))
-  // 取涨幅前15 + 跌幅前15
   const top = result.slice(0, 15)
   const bottom = result.slice(-15)
   const seen = new Set()
@@ -277,7 +325,7 @@ const fetchRankingFromEastMoney = async (direction, count = 15) => {
   const items = await fetchFromEastMoney({
     pn: 1, pz: count, po: direction === 'up' ? 1 : 0, np: 1,
     ut: EM_UT, fltt: 2, invt: 2,
-    fid: 'f3',  // 按涨跌幅排序
+    fid: 'f3',
     fs: 'm:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23,m:0 t:81 s:2048',
     fields: 'f2,f3,f4,f5,f6,f12,f14',
   })
@@ -295,14 +343,13 @@ const fetchRankingFromEastMoney = async (direction, count = 15) => {
 }
 
 /**
- * 从东方财富获取资金流向排行
- * 返回原始数值（元），前端负责格式化显示
+ * 从东方财富获取资金流向排行（按主力净流入金额排序）
  */
 const fetchFundFlowFromEastMoney = async (direction, count = 15) => {
   const items = await fetchFromEastMoney({
     pn: 1, pz: count, po: direction === 'inflow' ? 1 : 0, np: 1,
     ut: 'b2884a393a59ad64002292a3e90d46a5', fltt: 2, invt: 2,
-    fid: 'f62',  // 按主力净流入排序
+    fid: 'f62',
     fs: 'm:0 t:6 f:!2,m:0 t:13 f:!2,m:0 t:80 f:!2,m:1 t:2 f:!2,m:1 t:23 f:!2,m:0 t:7 f:!2,m:1 t:3 f:!2',
     fields: 'f12,f14,f2,f3,f62,f184,f66,f69,f72,f75,f78,f81,f84,f87,f204,f205,f124',
   })
@@ -321,14 +368,13 @@ const fetchFundFlowFromEastMoney = async (direction, count = 15) => {
 }
 
 /**
- * 从东方财富获取主力净流入占比排行（按占比排序，与绝对金额排行互补）
- * 返回原始数值（元），前端负责格式化显示
+ * 从东方财富获取主力净流入占比排行（按占比排序）
  */
 const fetchFundFlowPctFromEastMoney = async (direction, count = 15) => {
   const items = await fetchFromEastMoney({
     pn: 1, pz: count, po: direction === 'inflow' ? 1 : 0, np: 1,
     ut: 'b2884a393a59ad64002292a3e90d46a5', fltt: 2, invt: 2,
-    fid: 'f184',  // 按主力净流入占比排序
+    fid: 'f184',
     fs: 'm:0 t:6 f:!2,m:0 t:13 f:!2,m:0 t:80 f:!2,m:1 t:2 f:!2,m:1 t:23 f:!2,m:0 t:7 f:!2,m:1 t:3 f:!2',
     fields: 'f12,f14,f2,f3,f62,f184,f66,f69,f72,f75,f78,f81,f84,f87,f204,f205,f124',
   })
@@ -347,14 +393,14 @@ const fetchFundFlowPctFromEastMoney = async (direction, count = 15) => {
 }
 
 /**
- * 获取大盘指数实时数据（双通道：Vite直连 + 后端代理）
+ * 从东方财富获取大盘指数实时数据
  */
 const fetchIndexFromEastMoney = async () => {
-  const json = await _emFetch('/api/qt/ulist.np/get', 'ulist', {
+  const json = await fetchUlistFromEastMoney({
     fltt: '2', invt: '2',
     fields: 'f2,f3,f4,f6,f12,f14',
     secids: '1.000001,0.399001,0.399006',
-  }, 8000)
+  })
   if (!json.data?.diff) throw new Error('指数数据为空')
   const items = json.data.diff
   return {
@@ -364,95 +410,198 @@ const fetchIndexFromEastMoney = async () => {
   }
 }
 
-// ==================== akshare 后端集成 ====================
-let _akshareAvailable = null
-let _akshareCheckPromise = null
-let _akshareCheckTime = 0
-const AKSHARE_RECHECK_INTERVAL = 60000  // 60 秒后允许重新检查
+/**
+ * 从东方财富 datacenter 获取融资融券数据
+ * 返回最近20个交易日的融资余额、融资买入额、净买入额及时间序列
+ */
+const fetchFinancingFromDatacenter = async () => {
+  // 获取上交所融资融券汇总数据（按日期排序）
+  const data = await fetchFromDatacenter('RPTA_WEB_RZRQ_GGMX', {
+    columns: 'DATE,MARKET,RZYE,RZMRE,RZJME,RZCHE',
+    sortColumns: 'DATE',
+    sortTypes: '-1',
+    pageSize: '500',
+    filter: "(MARKET=\"融资融券_沪证\")",
+  }, 15000)
 
-const checkAkshareAvailable = async () => {
-  // 静态模式（GitHub Pages 无后端）直接返回不可用
-  if (IS_STATIC) {
-    _akshareAvailable = false
-    return false
+  if (!data || data.length === 0) {
+    return { balance: 0, buy: 0, repay: 0, net: 0, timeSharing: [] }
   }
-  // 60 秒内使用缓存结果，超过则重新检查
-  if (_akshareAvailable !== null && Date.now() - _akshareCheckTime < AKSHARE_RECHECK_INTERVAL) {
-    return _akshareAvailable
-  }
-  if (_akshareCheckPromise) return _akshareCheckPromise
 
-  _akshareCheckPromise = (async () => {
-    try {
-      const controller = new AbortController()
-      const timeoutId = setTimeout(() => controller.abort(), 5000)
-      const response = await fetch(`${API_BASE}/api/akshare/health`, {
-        signal: controller.signal,
-        headers: { 'Accept': 'application/json' }
-      })
-      clearTimeout(timeoutId)
-      _akshareAvailable = response.ok
-    } catch {
-      _akshareAvailable = false
-    } finally {
-      _akshareCheckPromise = null
-      _akshareCheckTime = Date.now()
+  // 按日期聚合，取最近20个交易日
+  const byDate = {}
+  for (const row of data) {
+    const dateStr = String(row.DATE || '').slice(0, 10)
+    if (!dateStr) continue
+    if (!byDate[dateStr]) {
+      byDate[dateStr] = { balance: 0, buy: 0, net: 0 }
     }
-    if (_akshareAvailable) console.log('[StockService] akshare 后端服务可用')
-    else console.warn('[StockService] akshare 后端不可用，使用东方财富直连API')
-    return _akshareAvailable
-  })()
+    byDate[dateStr].balance += Number(row.RZYE) || 0
+    byDate[dateStr].buy += Number(row.RZMRE) || 0
+    byDate[dateStr].net += Number(row.RZJME) || 0
+  }
 
-  return _akshareCheckPromise
+  const dates = Object.keys(byDate).sort()
+  const recent = dates.slice(-20)
+  const timeSharing = recent.map(d => ({
+    date: d.slice(5),
+    balance: byDate[d].balance,
+    net: byDate[d].net,
+  }))
+
+  const latest = recent.length > 0 ? byDate[recent[recent.length - 1]] : { balance: 0, buy: 0, net: 0 }
+  return {
+    balance: latest.balance,
+    buy: latest.buy,
+    repay: latest.buy - latest.net,
+    net: latest.net,
+    timeSharing,
+  }
 }
 
 /**
- * 重置 akshare 可用性检查（手动刷新时调用）
+ * 从东方财富 datacenter 获取 IPO 新股日历
  */
-export const resetAkshareCheck = () => {
-  _akshareAvailable = null
-  _akshareCheckTime = 0
+const fetchIPOFromDatacenter = async () => {
+  const data = await fetchFromDatacenter('RPT_NEWSTOCK_ISSUEINFO', {
+    sortColumns: 'DAT_ZHAOGURIQI',
+    sortTypes: '-1',
+    pageSize: '15',
+  }, 15000)
+
+  return data.map(row => {
+    const applyDate = String(row.DAT_ZHAOGURIQI || '').slice(0, 10)
+    return {
+      name: row.SECURITY_NAME_ABBR || '--',
+      code: String(row.SECUCODE || '').split('.')[0] || '--',
+      industry: null,
+      price: row.ISSUE_PRICE != null ? Number(row.ISSUE_PRICE) : null,
+      pe: row.PE_RATIO_AFTER != null ? Number(row.PE_RATIO_AFTER) : null,
+      applyDate,
+      listDate: null,
+      status: null,
+    }
+  })
 }
 
-const fetchFromAkshare = async (endpoint, timeout = 20000) => {
-  const url = `${API_BASE}/api/akshare${endpoint}`
-  const controller = new AbortController()
-  const timeoutId = setTimeout(() => controller.abort(), timeout)
-  try {
-    const response = await fetch(url, {
-      signal: controller.signal,
-      headers: { 'Accept': 'application/json' }
-    })
-    clearTimeout(timeoutId)
-    if (response.status === 503) return null
-    if (!response.ok) throw new Error(`akshare HTTP ${response.status}`)
-    return await response.json()
-  } catch (error) {
-    clearTimeout(timeoutId)
-    throw error
+/**
+ * 从东方财富 datacenter 获取解禁日历
+ */
+const fetchLockupFromDatacenter = async () => {
+  const now = new Date()
+  const startDate = now.toISOString().slice(0, 10)
+  const futureDate = new Date(now)
+  futureDate.setMonth(futureDate.getMonth() + 2)
+  const endDate = futureDate.toISOString().slice(0, 10)
+
+  const data = await fetchFromDatacenter('RPT_LIFT_STAGE', {
+    sortColumns: 'FREE_DATE',
+    sortTypes: '1',
+    pageSize: '15',
+    filter: `(FREE_DATE>='${startDate}')(FREE_DATE<='${endDate}')`,
+  }, 15000)
+
+  return data.map(row => ({
+    name: row.SECURITY_NAME_ABBR || '--',
+    code: row.SECURITY_CODE || '--',
+    type: row.FREE_SHARES_TYPE || '--',
+    date: String(row.FREE_DATE || '').slice(0, 10),
+    volume: Math.round((Number(row.CURRENT_FREE_SHARES) || 0) / 1e4, 1),
+    marketValue: Math.round((Number(row.LIFT_MARKET_CAP) || 0) / 1e4, 1),
+  }))
+}
+
+/**
+ * 从东方财富 datacenter 获取财报日历
+ */
+const fetchEarningsFromDatacenter = async () => {
+  const now = new Date()
+  const month = now.getMonth() + 1
+  let quarterDate
+  if (month <= 3) quarterDate = `${now.getFullYear() - 1}-12-31`
+  else if (month <= 6) quarterDate = `${now.getFullYear()}-03-31`
+  else if (month <= 9) quarterDate = `${now.getFullYear()}-06-30`
+  else quarterDate = `${now.getFullYear()}-09-30`
+
+  const data = await fetchFromDatacenter('RPT_LICO_FN_CPD', {
+    sortColumns: 'NOTICE_DATE',
+    sortTypes: '-1',
+    pageSize: '10',
+    filter: `(REPORTDATE='${quarterDate}')`,
+  }, 15000)
+
+  return data.map(row => ({
+    name: row.SECURITY_NAME_ABBR || '--',
+    code: row.SECURITY_CODE || '--',
+    type: '业绩快报',
+    date: String(row.NOTICE_DATE || '').slice(0, 10),
+    changePercent: Number(row.SJLTZ) || 0,
+  }))
+}
+
+/**
+ * 从东方财富 datacenter 获取北向资金历史数据
+ * 注意：北向资金实时数据自2024-08-19停止发布，此处返回最后有效历史数据
+ */
+const fetchNorthboundFromDatacenter = async () => {
+  const data = await fetchFromDatacenter('RPT_MUTUAL_DEAL_HISTORY', {
+    sortColumns: 'TRADE_DATE',
+    sortTypes: '-1',
+    pageSize: '30',
+    filter: '(MUTUAL_TYPE="001")',
+  }, 15000)
+
+  if (!data || data.length === 0) {
+    return { sh: [], sz: [], total: [], updateTime: '--' }
+  }
+
+  // 数据按日期降序返回，反转后按日期升序
+  const sorted = data.reverse()
+  const total = sorted.map(row => ({
+    time: String(row.TRADE_DATE || '').slice(5, 10),
+    value: Math.round((Number(row.NET_DEAL_AMT) || 0) / 10000, 2),
+  }))
+
+  // 北向资金实时数据已停发，NET_DEAL_AMT 可能为 null，使用 DEAL_AMT 作为参考
+  const validData = total.filter(t => t.value !== 0)
+  const lastDate = sorted.length > 0 ? String(sorted[sorted.length - 1].TRADE_DATE || '').slice(0, 10) : '--'
+
+  return {
+    sh: [],
+    sz: [],
+    total: validData.length > 0 ? validData : total,
+    updateTime: lastDate,
   }
 }
 
-// ==================== 格式化工具 ====================
-const formatVolume = (vol) => {
-  if (vol == null || vol === '-') return '--'
-  if (vol >= 100000000) return (vol / 100000000).toFixed(2) + '亿'
-  if (vol >= 10000) return (vol / 10000).toFixed(0) + '万'
-  return String(vol)
-}
+/**
+ * 从 open.er-api.com 获取汇率数据
+ * 返回美元、欧元、日元、英镑、港元兑人民币汇率
+ */
+const fetchExchangeRatesFromER = async () => {
+  const url = 'https://open.er-api.com/v6/latest/USD'
+  const json = await fetchWithFallback(url, 10000)
 
-const formatMoney = (num) => {
-  if (num == null || num === '-') return '--'
-  if (num >= 100000000) return (num / 100000000).toFixed(2) + '亿'
-  if (num >= 10000) return (num / 10000).toFixed(0) + '万'
-  return num.toFixed(0)
-}
+  if (json.result !== 'success') throw new Error('汇率API返回失败')
 
-const formatMarketCap = (num) => {
-  if (num == null) return '--'
-  if (num >= 1000000000000) return (num / 1000000000000).toFixed(2) + '万亿'
-  if (num >= 100000000) return (num / 100000000).toFixed(1) + '亿'
-  return num.toFixed(0) + '万'
+  const cny = json.rates.CNY
+  const eur = json.rates.EUR
+  const jpy = json.rates.JPY
+  const gbp = json.rates.GBP
+  const hkd = json.rates.HKD
+
+  if (!cny) throw new Error('未找到CNY汇率')
+
+  // 计算各货币兑人民币汇率（USD/CNY 已知，其他货币/CNY = (USD/CNY) / (USD/XXX)）
+  const result = [
+    { name: '美元/人民币', code: 'USDCNY', rate: cny.toFixed(4), change: '0.00' },
+  ]
+  if (eur) result.push({ name: '欧元/人民币', code: 'EURCNY', rate: (cny / eur).toFixed(4), change: '0.00' })
+  if (jpy) result.push({ name: '日元/人民币', code: 'JPYCNY', rate: (cny / jpy).toFixed(4), change: '0.00' })
+  if (gbp) result.push({ name: '英镑/人民币', code: 'GBPCNY', rate: (cny / gbp).toFixed(4), change: '0.00' })
+  if (hkd) result.push({ name: '港元/人民币', code: 'HKDCNY', rate: (cny / hkd).toFixed(4), change: '0.00' })
+
+  return result
 }
 
 // ==================== 公开 API ====================
@@ -461,27 +610,9 @@ const formatMarketCap = (num) => {
  * 获取所有股票行情数据（全市场实时）
  */
 export const getAllStockData = async (forceRefresh = false) => {
-  if (forceRefresh) {
-    resetAkshareCheck()
-    _cachedStockData = null
-  }
+  if (forceRefresh) _cachedStockData = null
   if (_cachedStockData && !forceRefresh) return _cachedStockData
 
-  // 优先 akshare 后端
-  await checkAkshareAvailable()
-  if (_akshareAvailable) {
-    try {
-      const data = await fetchFromAkshare('/stocks')
-      if (Array.isArray(data) && data.length > 0) {
-        _cachedStockData = data
-        return _cachedStockData
-      }
-    } catch (e) {
-      console.warn('[StockService] akshare 获取股票数据失败，降级到东方财富直连')
-    }
-  }
-
-  // 降级：东方财富直连API（全市场按市值排序前200）
   try {
     const data = await fetchStockListFromEastMoney()
     if (data.length > 0) {
@@ -489,9 +620,8 @@ export const getAllStockData = async (forceRefresh = false) => {
       return _cachedStockData
     }
   } catch (e) {
-    console.warn('[StockService] 东方财富直连获取股票数据失败:', e?.message)
+    console.warn('[StockService] 获取股票数据失败:', e?.message)
   }
-
   return []
 }
 
@@ -499,18 +629,6 @@ export const getAllStockData = async (forceRefresh = false) => {
  * 获取大盘分析数据（指数 + 涨跌家数）
  */
 export const getMarketAnalysis = async () => {
-  // 优先 akshare 后端
-  await checkAkshareAvailable()
-  if (_akshareAvailable) {
-    try {
-      const data = await fetchFromAkshare('/market_analysis')
-      if (data && data.shIndex && data.shIndex.value !== '--') return data
-    } catch (e) {
-      console.warn('[StockService] akshare 获取市场分析失败，降级到东方财富直连')
-    }
-  }
-
-  // 降级：东方财富直连（指数 + 涨跌统计）
   try {
     const [indexData, stats] = await Promise.all([
       fetchIndexFromEastMoney(),
@@ -530,7 +648,7 @@ export const getMarketAnalysis = async () => {
       marketSentiment: stats.upCount > stats.downCount ? '偏多' : stats.downCount > stats.upCount * 1.2 ? '偏空' : '震荡',
     }
   } catch (e) {
-    console.warn('[StockService] 东方财富直连市场分析失败:', e?.message)
+    console.warn('[StockService] 市场分析失败:', e?.message)
     return {
       shIndex: { value: '--', change: '0.00', name: '上证指数' },
       szIndex: { value: '--', change: '0.00', name: '深证成指' },
@@ -546,18 +664,6 @@ export const getMarketAnalysis = async () => {
  * 获取市场情绪数据（涨跌家数、涨跌停、炸板）
  */
 export const getMarketSentiment = async () => {
-  // 优先 akshare 后端
-  await checkAkshareAvailable()
-  if (_akshareAvailable) {
-    try {
-      const data = await fetchFromAkshare('/market_sentiment')
-      if (data && data.upCount !== undefined && data.upCount > 0) return data
-    } catch (e) {
-      console.warn('[StockService] akshare 获取市场情绪失败，降级到东方财富直连')
-    }
-  }
-
-  // 降级：东方财富直连（全市场涨跌统计）
   try {
     const stats = await fetchMarketStatsFromEastMoney()
     if (stats.upCount > 0 || stats.downCount > 0) {
@@ -567,9 +673,8 @@ export const getMarketSentiment = async () => {
       }
     }
   } catch (e) {
-    console.warn('[StockService] 东方财富直连市场情绪失败:', e?.message)
+    console.warn('[StockService] 市场情绪失败:', e?.message)
   }
-
   return {
     upCount: 0, downCount: 0, flatCount: 0,
     limitUpCount: 0, limitDownCount: 0, bombCount: 0,
@@ -581,31 +686,34 @@ export const getMarketSentiment = async () => {
  * 获取北向资金数据
  */
 export const getNorthboundCapital = async () => {
-  await checkAkshareAvailable()
-  if (_akshareAvailable) {
-    try {
-      const data = await fetchFromAkshare('/northbound')
-      if (data && data.sh && data.sh.length > 0) return data
-    } catch (e) {
-      console.warn('[StockService] akshare 获取北向资金失败')
+  const cached = getSlowCache('northbound')
+  if (cached) return cached
+  try {
+    const data = await fetchNorthboundFromDatacenter()
+    if (data.total.length > 0) {
+      setSlowCache('northbound', data)
+      return data
     }
+  } catch (e) {
+    console.warn('[StockService] 北向资金获取失败:', e?.message)
   }
   return { sh: [], sz: [], total: [], updateTime: '--' }
 }
 
 /**
  * 获取融资数据
- * 优先 akshare 后端，返回原始数值（元）
  */
 export const getFinancingData = async () => {
-  await checkAkshareAvailable()
-  if (_akshareAvailable) {
-    try {
-      const data = await fetchFromAkshare('/financing')
-      if (data && data.balance > 0) return data
-    } catch (e) {
-      console.warn('[StockService] akshare 获取融资数据失败')
+  const cached = getSlowCache('financing')
+  if (cached) return cached
+  try {
+    const data = await fetchFinancingFromDatacenter()
+    if (data.balance > 0) {
+      setSlowCache('financing', data)
+      return data
     }
+  } catch (e) {
+    console.warn('[StockService] 融资数据获取失败:', e?.message)
   }
   return { balance: 0, buy: 0, repay: 0, net: 0, timeSharing: [] }
 }
@@ -614,14 +722,16 @@ export const getFinancingData = async () => {
  * 获取IPO日历
  */
 export const getIPOCalendar = async () => {
-  await checkAkshareAvailable()
-  if (_akshareAvailable) {
-    try {
-      const data = await fetchFromAkshare('/ipo')
-      if (Array.isArray(data) && data.length > 0) return data
-    } catch (e) {
-      console.warn('[StockService] akshare 获取IPO日历失败')
+  const cached = getSlowCache('ipo')
+  if (cached) return cached
+  try {
+    const data = await fetchIPOFromDatacenter()
+    if (data.length > 0) {
+      setSlowCache('ipo', data)
+      return data
     }
+  } catch (e) {
+    console.warn('[StockService] IPO日历获取失败:', e?.message)
   }
   return []
 }
@@ -630,14 +740,16 @@ export const getIPOCalendar = async () => {
  * 获取解禁日历
  */
 export const getLockupCalendar = async () => {
-  await checkAkshareAvailable()
-  if (_akshareAvailable) {
-    try {
-      const data = await fetchFromAkshare('/lockup')
-      if (Array.isArray(data) && data.length > 0) return data
-    } catch (e) {
-      console.warn('[StockService] akshare 获取解禁日历失败')
+  const cached = getSlowCache('lockup')
+  if (cached) return cached
+  try {
+    const data = await fetchLockupFromDatacenter()
+    if (data.length > 0) {
+      setSlowCache('lockup', data)
+      return data
     }
+  } catch (e) {
+    console.warn('[StockService] 解禁日历获取失败:', e?.message)
   }
   return []
 }
@@ -646,14 +758,16 @@ export const getLockupCalendar = async () => {
  * 获取财报日历
  */
 export const getEarningsCalendar = async () => {
-  await checkAkshareAvailable()
-  if (_akshareAvailable) {
-    try {
-      const data = await fetchFromAkshare('/earnings')
-      if (Array.isArray(data) && data.length > 0) return data
-    } catch (e) {
-      console.warn('[StockService] akshare 获取财报日历失败')
+  const cached = getSlowCache('earnings')
+  if (cached) return cached
+  try {
+    const data = await fetchEarningsFromDatacenter()
+    if (data.length > 0) {
+      setSlowCache('earnings', data)
+      return data
     }
+  } catch (e) {
+    console.warn('[StockService] 财报日历获取失败:', e?.message)
   }
   return []
 }
@@ -662,17 +776,6 @@ export const getEarningsCalendar = async () => {
  * 获取全球指数
  */
 export const getGlobalIndices = async () => {
-  await checkAkshareAvailable()
-  if (_akshareAvailable) {
-    try {
-      const data = await fetchFromAkshare('/global_indices', 35000)
-      if (Array.isArray(data) && data.length > 0) return data
-    } catch (e) {
-      console.warn('[StockService] akshare 获取全球指数失败，降级到东方财富')
-    }
-  }
-
-  // 降级：东方财富直连
   try {
     const items = await fetchFromEastMoney({
       pn: 1, pz: 20, po: 1, np: 1,
@@ -690,9 +793,8 @@ export const getGlobalIndices = async () => {
       }))
     }
   } catch (e) {
-    console.warn('[StockService] 东方财富全球指数API失败:', e?.message)
+    console.warn('[StockService] 全球指数获取失败:', e?.message)
   }
-
   return []
 }
 
@@ -700,14 +802,16 @@ export const getGlobalIndices = async () => {
  * 获取汇率数据
  */
 export const getExchangeRates = async () => {
-  await checkAkshareAvailable()
-  if (_akshareAvailable) {
-    try {
-      const data = await fetchFromAkshare('/exchange_rates', 35000)
-      if (Array.isArray(data) && data.length > 0) return data
-    } catch (e) {
-      console.warn('[StockService] akshare 获取汇率失败')
+  const cached = getSlowCache('exchangeRates')
+  if (cached) return cached
+  try {
+    const data = await fetchExchangeRatesFromER()
+    if (data.length > 0) {
+      setSlowCache('exchangeRates', data)
+      return data
     }
+  } catch (e) {
+    console.warn('[StockService] 汇率获取失败:', e?.message)
   }
   return []
 }
@@ -716,49 +820,19 @@ export const getExchangeRates = async () => {
  * 获取板块热力图数据
  */
 export const getSectorHeatmap = async () => {
-  // 优先 akshare 后端
-  await checkAkshareAvailable()
-  if (_akshareAvailable) {
-    try {
-      const data = await fetchFromAkshare('/sector_heatmap', 30000)
-      if (Array.isArray(data) && data.length > 0) return data
-    } catch (e) {
-      console.warn('[StockService] akshare 获取板块热力图失败，降级到东方财富直连')
-    }
-  }
-
-  // 降级：东方财富直连（行业板块行情）
   try {
     const data = await fetchSectorDataFromEastMoney()
     if (data.length > 0) return data
   } catch (e) {
-    console.warn('[StockService] 东方财富直连板块热力图失败:', e?.message)
+    console.warn('[StockService] 板块热力图失败:', e?.message)
   }
-
   return []
 }
 
 /**
- * 获取涨幅/跌幅排行（全市场实时数据）
+ * 获取涨幅/跌幅排行
  */
 export const getPriceRanking = async () => {
-  // 优先 akshare 后端
-  await checkAkshareAvailable()
-  if (_akshareAvailable) {
-    try {
-      const [upData, downData] = await Promise.all([
-        fetchFromAkshare('/ranking?direction=up&count=15'),
-        fetchFromAkshare('/ranking?direction=down&count=15'),
-      ])
-      if (Array.isArray(upData) && upData.length > 0 && Array.isArray(downData) && downData.length > 0) {
-        return { up: upData, down: downData }
-      }
-    } catch (e) {
-      console.warn('[StockService] akshare 获取涨跌排行失败，降级到东方财富直连')
-    }
-  }
-
-  // 降级：东方财富直连
   try {
     const [up, down] = await Promise.all([
       fetchRankingFromEastMoney('up', 15),
@@ -766,34 +840,15 @@ export const getPriceRanking = async () => {
     ])
     return { up, down }
   } catch (e) {
-    console.warn('[StockService] 东方财富直连涨跌排行失败:', e?.message)
+    console.warn('[StockService] 涨跌排行失败:', e?.message)
   }
-
   return { up: [], down: [] }
 }
 
 /**
- * 获取资金流向排行（全市场实时数据）
- * 返回原始数值（元），前端负责格式化显示
+ * 获取资金流向排行
  */
 export const getCapitalRanking = async () => {
-  // 优先 akshare 后端
-  await checkAkshareAvailable()
-  if (_akshareAvailable) {
-    try {
-      const data = await fetchFromAkshare('/fund_flow_ranking', 20000)
-      if (data && Array.isArray(data.inflow) && data.inflow.length > 0) {
-        return {
-          inflow: data.inflow.map(s => ({ ...s })),
-          outflow: data.outflow.map(s => ({ ...s })),
-        }
-      }
-    } catch (e) {
-      console.warn('[StockService] akshare 获取资金流向排行失败，降级到东方财富直连')
-    }
-  }
-
-  // 降级：东方财富直连
   try {
     const [inflow, outflow] = await Promise.all([
       fetchFundFlowFromEastMoney('inflow', 15),
@@ -804,33 +859,26 @@ export const getCapitalRanking = async () => {
       outflow: outflow.map(s => ({ ...s })),
     }
   } catch (e) {
-    console.warn('[StockService] 东方财富直连资金流向排行失败:', e?.message)
+    console.warn('[StockService] 资金流向排行失败:', e?.message)
   }
-
   return { inflow: [], outflow: [] }
 }
 
 /**
- * 获取主力动向排行（按主力净流入占比排序，与"资金"tab的绝对金额排行互补）
- * 北向资金实时数据已于2024年8月停发，改用主力净流入占比作为主力动向指标
+ * 获取主力动向排行（按主力净流入占比排序）
  */
 export const getNorthboundRanking = async () => {
-  // 直接使用东方财富按主力净流入占比(f184)排序的API
   try {
     const [inflow, outflow] = await Promise.all([
       fetchFundFlowPctFromEastMoney('inflow', 15),
       fetchFundFlowPctFromEastMoney('outflow', 15),
     ])
     if (inflow.length > 0 || outflow.length > 0) {
-      return {
-        increase: inflow,
-        decrease: outflow,
-      }
+      return { increase: inflow, decrease: outflow }
     }
   } catch (e) {
-    console.warn('[StockService] 主力占比排行获取失败，降级到资金排行:', e?.message)
+    console.warn('[StockService] 主力占比排行失败:', e?.message)
   }
-
   // 降级：使用资金排行数据
   const data = await getCapitalRanking()
   return {
@@ -840,53 +888,36 @@ export const getNorthboundRanking = async () => {
 }
 
 /**
- * 从东方财富获取财经快讯（通过后端代理）
- * 后端 /api/akshare/em_news 已格式化返回标准新闻结构
+ * 获取重要财经新闻
  */
-const fetchNewsFromEastMoney = async () => {
-  const url = `${API_BASE}/api/akshare/em_news`
-  const controller = new AbortController()
-  const timeoutId = setTimeout(() => controller.abort(), 10000)
+export const getFinancialNews = async () => {
+  const cached = getSlowCache('news')
+  if (cached) return cached
   try {
-    const response = await fetch(url, {
-      signal: controller.signal,
-      headers: { 'Accept': 'application/json' }
-    })
-    clearTimeout(timeoutId)
-    if (!response.ok) throw new Error(`EM News HTTP ${response.status}`)
-    const data = await response.json()
-    if (Array.isArray(data) && data.length > 0) return data
-    return []
-  } catch (error) {
-    clearTimeout(timeoutId)
-    throw error
+    const newsList = await fetchNewsFromEastMoney()
+    if (newsList.length > 0) {
+      const result = newsList.slice(0, 15).map(item => ({
+        title: item.title || '--',
+        content: (item.summary || '').slice(0, 200),
+        time: item.showTime || '--',
+        url: item.code ? `https://finance.eastmoney.com/a/${item.code}.html` : '#',
+        source: '东方财富',
+      }))
+      setSlowCache('news', result)
+      return result
+    }
+  } catch (e) {
+    console.warn('[StockService] 新闻获取失败:', e?.message)
   }
+  return []
 }
 
 /**
- * 获取重要财经新闻
- * 优先 akshare 后端 /news 接口
- * 降级：东方财富 7x24 全球财经快讯 API
+ * 重置缓存（手动刷新时调用）
  */
-export const getFinancialNews = async () => {
-  // 静态模式无后端，东方财富新闻 API 不支持 CORS，跳过
-  if (IS_STATIC) return []
-
-  // 优先 akshare 后端
-  try {
-    const data = await fetchFromAkshare('/news', 15000)
-    if (Array.isArray(data) && data.length > 0) return data
-  } catch (e) {
-    console.warn('[StockService] akshare 获取新闻失败:', e?.message || e)
-  }
-
-  // 降级：东方财富直连
-  try {
-    const data = await fetchNewsFromEastMoney()
-    if (data.length > 0) return data
-  } catch (e) {
-    console.warn('[StockService] 东方财富新闻API失败:', e?.message)
-  }
-
-  return []
+export const resetAkshareCheck = () => {
+  _cachedStockData = null
+  _cachedMarketStats = null
+  _cachedMarketStatsTime = 0
+  Object.keys(_slowCache).forEach(k => { _slowCache[k] = null })
 }
