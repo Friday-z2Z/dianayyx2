@@ -148,10 +148,10 @@ const getWindDir = (deg) => {
 }
 
 // CORS 代理容错列表（Open-Meteo 已支持 CORS，代理仅作为降级备份）
+// 注意：cors.eu.org 易限流（429），whateverorigin 优先；其余代理均已失效
 const CORS_PROXIES = [
-  (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
-  (u) => `https://api.codetabs.com/v1/proxy/?quest=${u}`,
-  (u) => `https://corsproxy.io/?url=${encodeURIComponent(u)}`,
+  (u) => `https://www.whateverorigin.org/get?url=${encodeURIComponent(u)}`,
+  (u) => `https://cors.eu.org/${u}`,
 ]
 
 /**
@@ -186,7 +186,11 @@ const getWeatherFromOpenMeteo = async (cityName) => {
       const timeoutId = setTimeout(() => controller.abort(), 18000)
       const response = await fetch(CORS_PROXIES[i](url), { signal: controller.signal })
       clearTimeout(timeoutId)
-      if (response.ok) json = await response.json()
+      if (response.ok) {
+        const raw = await response.json()
+        // whateverorigin 返回 { contents: "...", status: {...} }，需要提取 contents
+        json = (raw && typeof raw.contents === 'string') ? JSON.parse(raw.contents) : raw
+      }
     } catch (e) {
       console.warn(`[WeatherService] CORS 代理 ${i} 失败:`, e.message)
     }

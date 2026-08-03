@@ -19,6 +19,13 @@ const bombRate = computed(() => {
   return total > 0 ? ((sentiment.value.bombCount / total) * 100).toFixed(1) : '0.0'
 })
 
+const sealingRate = computed(() => {
+  // 无炸板数据时无法计算封板率
+  if (!sentiment.value.bombCount) return '--'
+  const total = (sentiment.value.limitUpCount || 0) + sentiment.value.bombCount
+  return total > 0 ? (100 - (sentiment.value.bombCount / total) * 100).toFixed(1) : '--'
+})
+
 const loadSentimentData = async (silent = false) => {
   if (!silent) loading.value = true
   try {
@@ -34,59 +41,108 @@ const loadSentimentData = async (silent = false) => {
 
 const initChart = async () => {
   await new Promise(r => setTimeout(r, 50))
-  if (!sentiment.value.timeSharing) return
   const el = document.getElementById('sentiment-chart')
   if (!el) return
   if (chartInstance) chartInstance.dispose()
   chartInstance = echarts.init(el)
 
-  const { time, up, down } = sentiment.value.timeSharing
+  const up = sentiment.value.upCount || 0
+  const down = sentiment.value.downCount || 0
+  const flat = sentiment.value.flatCount || 0
+  const total = up + down + flat
+
+  // 有分时数据时展示走势线图
+  if (sentiment.value.timeSharing?.time?.length > 0) {
+    const { time, up: upArr, down: downArr } = sentiment.value.timeSharing
+    chartInstance.setOption({
+      backgroundColor: 'transparent',
+      grid: { left: 45, right: 10, top: 12, bottom: 20 },
+      tooltip: {
+        trigger: 'axis',
+        backgroundColor: 'rgba(20,20,20,0.92)',
+        borderColor: 'transparent',
+        textStyle: { color: '#fff', fontSize: 11 },
+        formatter: (params) => {
+          return `${params[0].name}<br/>上涨: <span style="color:#F23030;font-weight:700">${params[0].value}</span>家<br/>下跌: <span style="color:#00B42A;font-weight:700">${params[1].value}</span>家`
+        }
+      },
+      xAxis: {
+        type: 'category', data: time, boundaryGap: false,
+        axisLine: { lineStyle: { color: 'rgba(60,60,67,0.12)' } },
+        axisLabel: { color: '#8E8E93', fontSize: 9, interval: Math.floor(time.length / 4) },
+        splitLine: { show: false }
+      },
+      yAxis: {
+        type: 'value', axisLine: { show: false },
+        axisLabel: { color: '#8E8E93', fontSize: 9 },
+        splitLine: { lineStyle: { color: 'rgba(60,60,67,0.06)' } },
+        splitNumber: 3
+      },
+      series: [
+        {
+          name: '上涨', type: 'line', data: upArr, symbol: 'none',
+          lineStyle: { width: 1.5, color: '#F23030' },
+          areaStyle: {
+            color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+              { offset: 0, color: 'rgba(242,48,48,0.18)' },
+              { offset: 1, color: 'rgba(242,48,48,0.01)' }
+            ])
+          }
+        },
+        {
+          name: '下跌', type: 'line', data: downArr, symbol: 'none',
+          lineStyle: { width: 1.5, color: '#00B42A' },
+          areaStyle: {
+            color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+              { offset: 0, color: 'rgba(0,180,42,0.15)' },
+              { offset: 1, color: 'rgba(0,180,42,0.01)' }
+            ])
+          }
+        }
+      ]
+    })
+    return
+  }
+
+  // 无分时数据时展示涨跌分布环形图
+  const pieData = [
+    { value: up, name: '上涨', itemStyle: { color: '#F23030' } },
+    { value: down, name: '下跌', itemStyle: { color: '#00B42A' } },
+    { value: flat, name: '平盘', itemStyle: { color: '#8E8E93' } },
+  ].filter(d => d.value > 0)
+
   chartInstance.setOption({
     backgroundColor: 'transparent',
-    grid: { left: 45, right: 10, top: 12, bottom: 20 },
     tooltip: {
-      trigger: 'axis',
+      trigger: 'item',
       backgroundColor: 'rgba(20,20,20,0.92)',
       borderColor: 'transparent',
       textStyle: { color: '#fff', fontSize: 11 },
-      formatter: (params) => {
-        return `${params[0].name}<br/>上涨: <span style="color:#F23030;font-weight:700">${params[0].value}</span>家<br/>下跌: <span style="color:#00B42A;font-weight:700">${params[1].value}</span>家`
+      formatter: '{b}: {c}家 ({d}%)'
+    },
+    graphic: total > 0 ? {
+      type: 'text',
+      left: 'center',
+      top: 'center',
+      style: {
+        text: `${total}\n总家数`,
+        textAlign: 'center',
+        fill: '#8E8E93',
+        fontSize: 11,
+        fontWeight: 600,
+        lineHeight: 16,
       }
-    },
-    xAxis: {
-      type: 'category', data: time, boundaryGap: false,
-      axisLine: { lineStyle: { color: 'rgba(60,60,67,0.12)' } },
-      axisLabel: { color: '#8E8E93', fontSize: 9, interval: Math.floor(time.length / 4) },
-      splitLine: { show: false }
-    },
-    yAxis: {
-      type: 'value', axisLine: { show: false },
-      axisLabel: { color: '#8E8E93', fontSize: 9 },
-      splitLine: { lineStyle: { color: 'rgba(60,60,67,0.06)' } },
-      splitNumber: 3
-    },
-    series: [
-      {
-        name: '上涨', type: 'line', data: up, symbol: 'none',
-        lineStyle: { width: 1.5, color: '#F23030' },
-        areaStyle: {
-          color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-            { offset: 0, color: 'rgba(242,48,48,0.18)' },
-            { offset: 1, color: 'rgba(242,48,48,0.01)' }
-          ])
-        }
-      },
-      {
-        name: '下跌', type: 'line', data: down, symbol: 'none',
-        lineStyle: { width: 1.5, color: '#00B42A' },
-        areaStyle: {
-          color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-            { offset: 0, color: 'rgba(0,180,42,0.15)' },
-            { offset: 1, color: 'rgba(0,180,42,0.01)' }
-          ])
-        }
-      }
-    ]
+    } : undefined,
+    series: [{
+      type: 'pie',
+      radius: ['52%', '76%'],
+      center: ['50%', '50%'],
+      avoidLabelOverlap: false,
+      label: { show: false },
+      labelLine: { show: false },
+      itemStyle: { borderRadius: 3, borderWidth: 2, borderColor: '#1a1a1a' },
+      data: pieData.length > 0 ? pieData : [{ value: 1, name: '暂无数据', itemStyle: { color: '#30363d' } }],
+    }]
   })
 }
 
@@ -165,12 +221,12 @@ onUnmounted(() => {
         </span>
         <div class="limit-info">
           <span class="limit-label">封板率</span>
-          <span class="limit-value rate">{{ (100 - parseFloat(bombRate)).toFixed(1) }}%</span>
+          <span class="limit-value rate">{{ sealingRate }}{{ sealingRate !== '--' ? '%' : '' }}</span>
         </div>
       </div>
     </div>
 
-    <div class="dashboard-source">数据来源：akshare · 全市场涨跌家数分时 + 涨跌停/炸板实时统计</div>
+    <div class="dashboard-source">数据来源：东方财富 · 全市场涨跌家数分布 + 涨跌停/炸板实时统计</div>
   </div>
 </template>
 

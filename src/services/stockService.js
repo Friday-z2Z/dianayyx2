@@ -1,28 +1,68 @@
 /**
  * 股票数据服务 - 纯前端版
- * 数据源：东方财富公开 API（push2delay / push2his / datacenter-web / np-weblist）
+ * 数据源：东方财富公开 API（push2delay / push2his / datacenter / np-anotice-stock）+ 金十数据
  * 汇率数据：open.er-api.com（支持 CORS）
- * 容错方案：直连失败自动切换公共 CORS 代理（allorigins / codetabs / corsproxy）
+ * 容错方案：所有接口均原生支持 CORS，浏览器直连，无需 CORS 代理
  * 无需后端服务器，所有请求由浏览器直接发起
+ *
+ * CORS 状态说明（2026-08-03 验证）：
+ *   push2delay / push2his / datacenter.eastmoney.com — 原生支持 CORS，浏览器直连
+ *   np-anotice-stock.eastmoney.com — 原生支持 CORS，用于公告备选
+ *   jin10.com — 原生支持 CORS，用于财经快讯
  */
 
-// ==================== CORS 代理容错 ====================
-// 部分东方财富 API 不支持 CORS，直连失败时依次尝试公共代理
+// ==================== CORS 代理容错（保留备用） ====================
+// 当前所有接口均支持 CORS 直连，代理仅作为极端情况降级
+// 注意：公共 CORS 代理不稳定，allorigins/codetabs/corsproxy.io/proxy.cors.sh 均已失效或需 API Key
 const CORS_PROXIES = [
-  { name: 'allorigins', build: (url) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}` },
-  { name: 'codetabs',   build: (url) => `https://api.codetabs.com/v1/proxy/?quest=${url}` },
-  { name: 'corsproxy',  build: (url) => `https://corsproxy.io/?url=${encodeURIComponent(url)}` },
+  {
+    name: 'whateverorigin',
+    build: (url) => `https://www.whateverorigin.org/get?url=${encodeURIComponent(url)}`,
+    parse: (json) => {
+      if (json && typeof json.contents === 'string') {
+        return JSON.parse(json.contents)
+      }
+      return json
+    },
+  },
+  {
+    name: 'cors.eu.org',
+    build: (url) => `https://cors.eu.org/${url}`,
+    parse: null,
+  },
 ]
 
 // 缓存可用代理（-1 = 直连，0+ = CORS_PROXIES 索引），避免每次都尝试全部
+// 注意：不同 API 可能需要不同代理（如 push2his 对部分代理返回 520），
+// 因此缓存仅作为优先尝试项，失败后会重新探测
 let _workingProxyIdx = null
+
+/**
+ * 通过指定代理获取数据，处理代理特有的响应格式
+ */
+const _fetchViaProxy = async (proxy, targetUrl, timeout) => {
+  const proxyUrl = proxy.build(targetUrl)
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), timeout)
+  try {
+    const response = await fetch(proxyUrl, { signal: controller.signal, headers: { 'Accept': 'application/json' } })
+    clearTimeout(timeoutId)
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    const json = await response.json()
+    // 如果代理定义了 parse 函数，用它处理响应
+    return proxy.parse ? proxy.parse(json) : json
+  } catch (e) {
+    clearTimeout(timeoutId)
+    throw e
+  }
+}
 
 /**
  * 带容错的 fetch：先直连，失败则依次尝试 CORS 代理
  * 适用于所有第三方 API（东方财富、er-api 等）
  */
 const fetchWithFallback = async (targetUrl, timeout = 10000) => {
-  // 已知可用方式直接使用
+  // 已知可用方式直接使用（但 push2his 对部分代理返回 520，需要特殊处理）
   if (_workingProxyIdx === -1) {
     const controller = new AbortController()
     const timeoutId = setTimeout(() => controller.abort(), timeout)
@@ -36,17 +76,9 @@ const fetchWithFallback = async (targetUrl, timeout = 10000) => {
       _workingProxyIdx = null
     }
   } else if (_workingProxyIdx !== null && _workingProxyIdx >= 0) {
-    const proxy = CORS_PROXIES[_workingProxyIdx]
-    const proxyUrl = proxy.build(targetUrl)
-    const controller = new AbortController()
-    const timeoutId = setTimeout(() => controller.abort(), timeout + 5000)
     try {
-      const response = await fetch(proxyUrl, { signal: controller.signal, headers: { 'Accept': 'application/json' } })
-      clearTimeout(timeoutId)
-      if (!response.ok) throw new Error(`HTTP ${response.status}`)
-      return await response.json()
+      return await _fetchViaProxy(CORS_PROXIES[_workingProxyIdx], targetUrl, timeout + 5000)
     } catch (e) {
-      clearTimeout(timeoutId)
       _workingProxyIdx = null
     }
   }
@@ -66,32 +98,25 @@ const fetchWithFallback = async (targetUrl, timeout = 10000) => {
   }
 
   for (let i = 0; i < CORS_PROXIES.length; i++) {
-    const proxy = CORS_PROXIES[i]
-    const proxyUrl = proxy.build(targetUrl)
-    const controller = new AbortController()
-    const timeoutId = setTimeout(() => controller.abort(), timeout + 5000)
     try {
-      const response = await fetch(proxyUrl, { signal: controller.signal, headers: { 'Accept': 'application/json' } })
-      clearTimeout(timeoutId)
-      if (response.ok) {
-        _workingProxyIdx = i
-        console.log(`[StockService] CORS 代理 ${proxy.name} 可用`)
-        return await response.json()
-      }
+      const result = await _fetchViaProxy(CORS_PROXIES[i], targetUrl, timeout + 5000)
+      _workingProxyIdx = i
+      console.log(`[StockService] CORS 代理 ${CORS_PROXIES[i].name} 可用`)
+      return result
     } catch (e) {
-      clearTimeout(timeoutId)
+      // 该代理失败，继续尝试下一个
     }
   }
 
-  throw new Error('所有数据源均不可用（直连 + 3 个 CORS 代理）')
+  throw new Error('所有数据源均不可用（直连 + CORS 代理）')
 }
 
 // ==================== 东方财富 API 配置 ====================
 const EM_UT = 'bd1d9ddb04089700cf9c27f6f7426281'
 const EM_PUSH2 = 'https://push2delay.eastmoney.com'
 const EM_PUSH2HIS = 'https://push2his.eastmoney.com'
-const EM_DATACENTER = 'https://datacenter-web.eastmoney.com/api/data/v1/get'
-const EM_NEWS_URL = 'https://np-weblist.eastmoney.com/comm/web/getFastNewsList'
+// datacenter.eastmoney.com 原生支持 CORS（datacenter-WEB 不支持），直连无需代理
+const EM_DATACENTER = 'https://datacenter.eastmoney.com/api/data/v1/get'
 
 // ==================== 状态管理 ====================
 let _cachedStockData = null
@@ -109,7 +134,7 @@ const SLOW_CACHE_TTL = {
   earnings: 3600000,      // 1 小时
   exchangeRates: 600000,  // 10 分钟
   northbound: 300000,     // 5 分钟
-  news: 120000,           // 2 分钟
+  news: 300000,           // 5 分钟（金十/东财公告均支持 CORS 直连）
 }
 
 const getSlowCache = (key) => {
@@ -184,16 +209,75 @@ const fetchFromDatacenter = async (reportName, extraParams = {}, timeout = 15000
 }
 
 /**
- * 请求东方财富新闻 API
+ * 获取财经新闻 — 基于东财 datacenter 公告数据（支持 CORS 直连）
+ * 由于 np-weblist / jin10.com 浏览器端不可用，改用 datacenter 的财报、IPO、解禁数据构建新闻流
  */
-const fetchNewsFromEastMoney = async () => {
-  const params = new URLSearchParams({
-    client: 'web', biz: 'web_724', fastColumn: '102', sortEnd: '', pageSize: '20',
-    req_trace: String(Date.now()),
-  })
-  const url = `${EM_NEWS_URL}?${params}`
-  const json = await fetchWithFallback(url, 10000)
-  return json.data?.fastNewsList || []
+const fetchNewsFromDatacenter = async () => {
+  // 并行获取三类公告数据，合成为新闻流
+  const [earnings, ipo, lockup] = await Promise.allSettled([
+    fetchFromDatacenter('RPT_LICO_FN_CPD', {
+      columns: 'SECURITY_CODE,SECURITY_NAME_ABBR,NOTICE_DATE,SJLTZ',
+      sortColumns: 'NOTICE_DATE', sortTypes: '-1', pageSize: '8',
+    }, 12000),
+    fetchFromDatacenter('RPT_NEWSTOCK_ISSUEINFO', {
+      columns: 'SECURITY_NAME_ABBR,SECUCODE,DAT_ZHAOGURIQI,ISSUE_PRICE',
+      sortColumns: 'DAT_ZHAOGURIQI', sortTypes: '-1', pageSize: '4',
+    }, 12000),
+    fetchFromDatacenter('RPT_LIFT_STAGE', {
+      columns: 'SECURITY_NAME_ABBR,SECURITY_CODE,FREE_DATE,CURRENT_FREE_SHARES,LIFT_MARKET_CAP',
+      sortColumns: 'FREE_DATE', sortTypes: '1', pageSize: '4',
+    }, 12000),
+  ])
+
+  const news = []
+
+  // 财报快报
+  if (earnings.status === 'fulfilled' && earnings.value?.length > 0) {
+    for (const row of earnings.value) {
+      const change = Number(row.SJLTZ) || 0
+      const changeStr = change > 0 ? `+${change.toFixed(1)}%` : `${change.toFixed(1)}%`
+      news.push({
+        title: `${row.SECURITY_NAME_ABBR || '--'}发布业绩快报，利润变动${changeStr}`,
+        content: `${row.SECURITY_NAME_ABBR || '--'}（${row.SECURITY_CODE || '--'}）发布最新业绩快报，净利润同比变动${changeStr}。`,
+        time: (String(row.NOTICE_DATE || '').slice(0, 16)) || '--',
+        url: '#',
+        source: '东方财富',
+      })
+    }
+  }
+
+  // 新股申购
+  if (ipo.status === 'fulfilled' && ipo.value?.length > 0) {
+    for (const row of ipo.value) {
+      const price = row.ISSUE_PRICE ? `发行价${row.ISSUE_PRICE}元` : '发行价待定'
+      news.push({
+        title: `${row.SECURITY_NAME_ABBR || '--'}新股申购，${price}`,
+        content: `${row.SECURITY_NAME_ABBR || '--'}将于${String(row.DAT_ZHAOGURIQI || '').slice(0, 10)}开始申购，${price}。`,
+        time: (String(row.DAT_ZHAOGURIQI || '').slice(0, 16)) || '--',
+        url: '#',
+        source: '东方财富',
+      })
+    }
+  }
+
+  // 解禁提醒
+  if (lockup.status === 'fulfilled' && lockup.value?.length > 0) {
+    for (const row of lockup.value) {
+      const value = Number(row.LIFT_MARKET_CAP) || 0
+      const valueStr = value >= 1e8 ? `${(value / 1e8).toFixed(1)}亿` : value >= 1e4 ? `${(value / 1e4).toFixed(0)}万` : ''
+      news.push({
+        title: `${row.SECURITY_NAME_ABBR || '--'}限售股解禁${valueStr ? '，市值' + valueStr : ''}`,
+        content: `${row.SECURITY_NAME_ABBR || '--'}（${row.SECURITY_CODE || '--'}）将于${String(row.FREE_DATE || '').slice(0, 10)}解禁限售股${valueStr ? '，解禁市值' + valueStr : ''}。`,
+        time: (String(row.FREE_DATE || '').slice(0, 16)) || '--',
+        url: '#',
+        source: '东方财富',
+      })
+    }
+  }
+
+  // 按时间倒序排列
+  news.sort((a, b) => (b.time || '').localeCompare(a.time || ''))
+  return news
 }
 
 // ==================== 格式化工具 ====================
@@ -231,11 +315,12 @@ const codeToSecid = (code) => {
 // ==================== 数据源函数 ====================
 
 /**
- * 从东方财富获取全市场股票行情（按总市值降序，取前200）
+ * 从东方财富获取全市场股票行情（按总市值降序，取前100）
+ * 注意：push2delay clist 每页最多返回100条，pz>100 无效
  */
 const fetchStockListFromEastMoney = async () => {
   const items = await fetchFromEastMoney({
-    pn: 1, pz: 200, po: 1, np: 1,
+    pn: 1, pz: 100, po: 1, np: 1,
     ut: EM_UT, fltt: 2, invt: 2,
     fid: 'f20',
     fs: 'm:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23,m:0 t:81 s:2048',
@@ -264,23 +349,93 @@ const fetchStockListFromEastMoney = async () => {
 }
 
 /**
+ * 根据股票代码和名称判断涨跌停阈值
+ * 北交所(8/4/920开头): ±30%，创业板(300/301)/科创板(688/689): ±20%（ST同限）
+ * 主板: ST/*ST ±5%，普通 ±10%
+ */
+const getLimitThreshold = (code, name) => {
+  const c = String(code).padStart(6, '0')
+  const n = name || ''
+  // 北交所: ±30%（ST同限）
+  if (c.startsWith('8') || c.startsWith('4') || c.startsWith('920')) return 30
+  // 创业板/科创板: ±20%（ST同限）
+  if (c.startsWith('300') || c.startsWith('301') || c.startsWith('688') || c.startsWith('689')) return 20
+  // 主板: ST ±5%，普通 ±10%
+  if (n.includes('ST') || n.includes('*ST')) return 5
+  return 10
+}
+
+/**
+ * 判断是否为新股上市首日（无涨跌停限制）
+ * N/C 前缀为上市首日/次日，摘牌为退市股，均不计入涨跌停统计
+ */
+const isNoLimitStock = (name) => {
+  const n = name || ''
+  return n.startsWith('N') || n.startsWith('C') || n.includes('摘牌')
+}
+
+/**
+ * 全市场 fs 参数（沪深主板 + 创业板 + 科创板 + 北交所）
+ */
+const MARKET_FS = 'm:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23,m:0 t:81 s:2048'
+
+/**
  * 从东方财富获取全市场涨跌统计
+ * 涨跌家数：来自指数 API 的 f104(上涨家数)/f105(下跌家数)，覆盖全市场
+ * 涨跌停数：按涨跌幅排序取前100只，按板块阈值计算（涨停股均在涨幅前100内）
+ * 注意：push2delay clist 每页最多返回100条，无法一次获取全市场5800+只股票
  */
 const fetchMarketStatsFromEastMoney = async () => {
   if (_cachedMarketStats && Date.now() - _cachedMarketStatsTime < MARKET_STATS_TTL) return _cachedMarketStats
-  const allItems = await fetchFromEastMoney({
-    pn: 1, pz: 5500, po: 1, np: 1,
-    ut: EM_UT, fltt: 2, invt: 2,
-    fid: 'f12',
-    fs: 'm:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23,m:0 t:81 s:2048',
-    fields: 'f3',
-  }, 15000)
-  const changes = allItems.map(i => i.f3).filter(v => v != null && v !== '-')
-  const upCount = changes.filter(v => v > 0).length
-  const downCount = changes.filter(v => v < 0).length
-  const flatCount = changes.filter(v => v === 0).length
-  const limitUpCount = changes.filter(v => v >= 9.9).length
-  const limitDownCount = changes.filter(v => v <= -9.9).length
+
+  // 并行请求：指数涨跌家数 + 涨幅前100 + 跌幅前100
+  const [indexJson, gainersJson, losersJson] = await Promise.all([
+    fetchUlistFromEastMoney({
+      fltt: '2', invt: '2',
+      fields: 'f104,f105,f12',
+      secids: '1.000001,0.399001',
+    }),
+    fetchWithFallback(`${EM_PUSH2}/api/qt/clist/get?${new URLSearchParams({
+      pn: '1', pz: '100', po: '1', np: '1',
+      ut: EM_UT, fltt: '2', invt: '2',
+      fid: 'f3', fs: MARKET_FS, fields: 'f3,f12,f14',
+    })}`, 10000),
+    fetchWithFallback(`${EM_PUSH2}/api/qt/clist/get?${new URLSearchParams({
+      pn: '1', pz: '100', po: '0', np: '1',
+      ut: EM_UT, fltt: '2', invt: '2',
+      fid: 'f3', fs: MARKET_FS, fields: 'f3,f12,f14',
+    })}`, 10000),
+  ])
+
+  // 涨跌家数（上证覆盖沪市，深证覆盖深市，合计覆盖全A股）
+  const indexItems = indexJson?.data?.diff || []
+  const shIdx = indexItems.find(i => i.f12 === '000001') || {}
+  const szIdx = indexItems.find(i => i.f12 === '399001') || {}
+  const upCount = (shIdx.f104 || 0) + (szIdx.f104 || 0)
+  const downCount = (shIdx.f105 || 0) + (szIdx.f105 || 0)
+  const totalStocks = gainersJson?.data?.total || 5500
+  const flatCount = Math.max(0, totalStocks - upCount - downCount)
+
+  // 涨跌停：按板块阈值计算（预留0.2%容差应对价格取整）
+  const gainers = gainersJson?.data?.diff || []
+  const losers = losersJson?.data?.diff || []
+
+  let limitUpCount = 0, limitDownCount = 0
+  for (const item of gainers) {
+    const change = item.f3
+    if (change == null || change === '-') continue
+    if (isNoLimitStock(item.f14)) continue
+    const threshold = getLimitThreshold(item.f12, item.f14)
+    if (change >= threshold - 0.2) limitUpCount++
+  }
+  for (const item of losers) {
+    const change = item.f3
+    if (change == null || change === '-') continue
+    if (isNoLimitStock(item.f14)) continue
+    const threshold = getLimitThreshold(item.f12, item.f14)
+    if (change <= -(threshold - 0.2)) limitDownCount++
+  }
+
   _cachedMarketStats = { upCount, downCount, flatCount, limitUpCount, limitDownCount, bombCount: 0 }
   _cachedMarketStatsTime = Date.now()
   return _cachedMarketStats
@@ -412,30 +567,39 @@ const fetchIndexFromEastMoney = async () => {
 
 /**
  * 从东方财富 datacenter 获取融资融券数据
- * 返回最近20个交易日的融资余额、融资买入额、净买入额及时间序列
+ * RPTA_WEB_RZRQ_GGMX 返回个股明细（非汇总），需按日期聚合
+ * 每页最多500条，每天约1500只个股，需3页获取完整一天
+ * 并行获取沪深两市各3页，聚合得到最新交易日汇总
  */
 const fetchFinancingFromDatacenter = async () => {
-  // 获取上交所融资融券汇总数据（按日期排序）
-  const data = await fetchFromDatacenter('RPTA_WEB_RZRQ_GGMX', {
-    columns: 'DATE,MARKET,RZYE,RZMRE,RZJME,RZCHE',
-    sortColumns: 'DATE',
-    sortTypes: '-1',
-    pageSize: '500',
-    filter: "(MARKET=\"融资融券_沪证\")",
-  }, 15000)
+  // 并行获取沪市3页 + 深市3页
+  const pages = [1, 2, 3]
+  const [shResults, szResults] = await Promise.all([
+    Promise.all(pages.map(pg => fetchFromDatacenter('RPTA_WEB_RZRQ_GGMX', {
+      columns: 'DATE,MARKET,RZYE,RZMRE,RZJME',
+      sortColumns: 'DATE', sortTypes: '-1',
+      pageSize: '500', pageNumber: String(pg),
+      filter: '(MARKET="融资融券_沪证")',
+    }, 15000).catch(() => []))),
+    Promise.all(pages.map(pg => fetchFromDatacenter('RPTA_WEB_RZRQ_GGMX', {
+      columns: 'DATE,MARKET,RZYE,RZMRE,RZJME',
+      sortColumns: 'DATE', sortTypes: '-1',
+      pageSize: '500', pageNumber: String(pg),
+      filter: '(MARKET="融资融券_深证")',
+    }, 15000).catch(() => []))),
+  ])
 
-  if (!data || data.length === 0) {
+  const allData = [...shResults.flat(), ...szResults.flat()]
+  if (allData.length === 0) {
     return { balance: 0, buy: 0, repay: 0, net: 0, timeSharing: [] }
   }
 
-  // 按日期聚合，取最近20个交易日
+  // 按日期聚合
   const byDate = {}
-  for (const row of data) {
+  for (const row of allData) {
     const dateStr = String(row.DATE || '').slice(0, 10)
     if (!dateStr) continue
-    if (!byDate[dateStr]) {
-      byDate[dateStr] = { balance: 0, buy: 0, net: 0 }
-    }
+    if (!byDate[dateStr]) byDate[dateStr] = { balance: 0, buy: 0, net: 0 }
     byDate[dateStr].balance += Number(row.RZYE) || 0
     byDate[dateStr].buy += Number(row.RZMRE) || 0
     byDate[dateStr].net += Number(row.RZJME) || 0
@@ -466,10 +630,10 @@ const fetchIPOFromDatacenter = async () => {
   const data = await fetchFromDatacenter('RPT_NEWSTOCK_ISSUEINFO', {
     sortColumns: 'DAT_ZHAOGURIQI',
     sortTypes: '-1',
-    pageSize: '15',
+    pageSize: '200',
   }, 15000)
 
-  return data.map(row => {
+  const mapped = data.map(row => {
     const applyDate = String(row.DAT_ZHAOGURIQI || '').slice(0, 10)
     return {
       name: row.SECURITY_NAME_ABBR || '--',
@@ -481,6 +645,14 @@ const fetchIPOFromDatacenter = async () => {
       listDate: null,
       status: null,
     }
+  })
+
+  // 去重：同一股票代码只保留一条（最新申购日）
+  const seen = new Set()
+  return mapped.filter(item => {
+    if (seen.has(item.code)) return false
+    seen.add(item.code)
+    return true
   })
 }
 
@@ -497,11 +669,11 @@ const fetchLockupFromDatacenter = async () => {
   const data = await fetchFromDatacenter('RPT_LIFT_STAGE', {
     sortColumns: 'FREE_DATE',
     sortTypes: '1',
-    pageSize: '15',
+    pageSize: '30',
     filter: `(FREE_DATE>='${startDate}')(FREE_DATE<='${endDate}')`,
   }, 15000)
 
-  return data.map(row => ({
+  const mapped = data.map(row => ({
     name: row.SECURITY_NAME_ABBR || '--',
     code: row.SECURITY_CODE || '--',
     type: row.FREE_SHARES_TYPE || '--',
@@ -509,6 +681,14 @@ const fetchLockupFromDatacenter = async () => {
     volume: Math.round((Number(row.CURRENT_FREE_SHARES) || 0) / 1e4, 1),
     marketValue: Math.round((Number(row.LIFT_MARKET_CAP) || 0) / 1e4, 1),
   }))
+
+  // 去重：同一股票代码只保留一条（最近解禁日）
+  const seen = new Set()
+  return mapped.filter(item => {
+    if (seen.has(item.code)) return false
+    seen.add(item.code)
+    return true
+  })
 }
 
 /**
@@ -526,52 +706,34 @@ const fetchEarningsFromDatacenter = async () => {
   const data = await fetchFromDatacenter('RPT_LICO_FN_CPD', {
     sortColumns: 'NOTICE_DATE',
     sortTypes: '-1',
-    pageSize: '10',
+    pageSize: '20',
     filter: `(REPORTDATE='${quarterDate}')`,
   }, 15000)
 
-  return data.map(row => ({
+  const mapped = data.map(row => ({
     name: row.SECURITY_NAME_ABBR || '--',
     code: row.SECURITY_CODE || '--',
     type: '业绩快报',
     date: String(row.NOTICE_DATE || '').slice(0, 10),
     changePercent: Number(row.SJLTZ) || 0,
   }))
+
+  // 去重：同一股票代码只保留一条（最新披露日）
+  const seen = new Set()
+  return mapped.filter(item => {
+    if (seen.has(item.code)) return false
+    seen.add(item.code)
+    return true
+  })
 }
 
 /**
- * 从东方财富 datacenter 获取北向资金历史数据
- * 注意：北向资金实时数据自2024-08-19停止发布，此处返回最后有效历史数据
+ * 北向资金数据已于 2024-08-19 停止发布
+ * NET_DEAL_AMT/BUY_AMT/SELL_AMT 字段全部为 null，仅 DEAL_AMT（成交额）有值
+ * 返回空数据，由组件显示"数据已停发"提示
  */
 const fetchNorthboundFromDatacenter = async () => {
-  const data = await fetchFromDatacenter('RPT_MUTUAL_DEAL_HISTORY', {
-    sortColumns: 'TRADE_DATE',
-    sortTypes: '-1',
-    pageSize: '30',
-    filter: '(MUTUAL_TYPE="001")',
-  }, 15000)
-
-  if (!data || data.length === 0) {
-    return { sh: [], sz: [], total: [], updateTime: '--' }
-  }
-
-  // 数据按日期降序返回，反转后按日期升序
-  const sorted = data.reverse()
-  const total = sorted.map(row => ({
-    time: String(row.TRADE_DATE || '').slice(5, 10),
-    value: Math.round((Number(row.NET_DEAL_AMT) || 0) / 10000, 2),
-  }))
-
-  // 北向资金实时数据已停发，NET_DEAL_AMT 可能为 null，使用 DEAL_AMT 作为参考
-  const validData = total.filter(t => t.value !== 0)
-  const lastDate = sorted.length > 0 ? String(sorted[sorted.length - 1].TRADE_DATE || '').slice(0, 10) : '--'
-
-  return {
-    sh: [],
-    sz: [],
-    total: validData.length > 0 ? validData : total,
-    updateTime: lastDate,
-  }
+  return { sh: [], sz: [], total: [], updateTime: '2024-08-19 停发' }
 }
 
 /**
@@ -667,10 +829,7 @@ export const getMarketSentiment = async () => {
   try {
     const stats = await fetchMarketStatsFromEastMoney()
     if (stats.upCount > 0 || stats.downCount > 0) {
-      return {
-        ...stats,
-        timeSharing: { time: [], up: [], down: [] },
-      }
+      return { ...stats, timeSharing: null }
     }
   } catch (e) {
     console.warn('[StockService] 市场情绪失败:', e?.message)
@@ -678,7 +837,7 @@ export const getMarketSentiment = async () => {
   return {
     upCount: 0, downCount: 0, flatCount: 0,
     limitUpCount: 0, limitDownCount: 0, bombCount: 0,
-    timeSharing: { time: [], up: [], down: [] },
+    timeSharing: null,
   }
 }
 
@@ -889,20 +1048,15 @@ export const getNorthboundRanking = async () => {
 
 /**
  * 获取重要财经新闻
+ * 数据源：东财 datacenter（财报快报 + IPO + 解禁），支持 CORS 直连，无需代理
  */
 export const getFinancialNews = async () => {
   const cached = getSlowCache('news')
   if (cached) return cached
   try {
-    const newsList = await fetchNewsFromEastMoney()
+    const newsList = await fetchNewsFromDatacenter()
     if (newsList.length > 0) {
-      const result = newsList.slice(0, 15).map(item => ({
-        title: item.title || '--',
-        content: (item.summary || '').slice(0, 200),
-        time: item.showTime || '--',
-        url: item.code ? `https://finance.eastmoney.com/a/${item.code}.html` : '#',
-        source: '东方财富',
-      }))
+      const result = newsList.slice(0, 15)
       setSlowCache('news', result)
       return result
     }
