@@ -49,7 +49,6 @@ const handleHeaderTap = () => {
 const globalRefreshing = ref(false)
 const refreshKey = ref(0)
 const refreshSilent = ref(false)
-const lastRefreshTime = ref('')
 
 // Scroll position memory (for tab switching)
 const savedScrollTop = ref(0)
@@ -100,7 +99,6 @@ const handleGlobalRefresh = async () => {
   globalRefreshing.value = true
   refreshSilent.value = false
   refreshKey.value++
-  lastRefreshTime.value = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
   await loadWeather()
   setTimeout(() => { globalRefreshing.value = false }, 800)
 }
@@ -128,7 +126,6 @@ const startTimers = () => {
   autoRefreshTimer = setInterval(() => {
     refreshSilent.value = true
     refreshKey.value++
-    lastRefreshTime.value = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
   }, 120000)
 }
 
@@ -140,7 +137,6 @@ const stopTimers = () => {
 onMounted(() => {
   setTimeout(() => { showContent.value = true }, 50)
   loadWeather()
-  lastRefreshTime.value = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
   startTimers()
 })
 
@@ -191,7 +187,6 @@ onUnmounted(() => {
             </transition>
           </div>
           <div class="sticky-right">
-            <span class="refresh-time" v-if="lastRefreshTime">{{ lastRefreshTime }}</span>
             <button class="global-refresh-btn" :class="{ spinning: globalRefreshing }" @click.stop="handleGlobalRefresh">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14">
                 <path d="M23 4v6h-6M1 20v-6h6"/>
@@ -365,11 +360,6 @@ onUnmounted(() => {
   letter-spacing: 0.02em;
 }
 .sticky-right { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
-.refresh-time {
-  font-size: 10px; font-weight: 600;
-  color: var(--color-text-tertiary);
-  font-variant-numeric: tabular-nums;
-}
 .global-refresh-btn {
   display: flex; align-items: center; justify-content: center;
   width: 30px; height: 30px;
@@ -469,14 +459,13 @@ onUnmounted(() => {
   overflow-x: auto;
   -webkit-overflow-scrolling: touch;
   scrollbar-width: none;
-  transition: all 0.35s var(--ease-out-expo);
+  /* 不过渡 top：header 高度变化是瞬间的，tab bar 的 top 也必须瞬间同步，
+     否则两者不同步会产生 4px 间隙露出滚动内容导致闪白 */
+  border-bottom: 1px solid transparent;
 }
 .sub-tab-bar::-webkit-scrollbar { display: none; }
 .sub-tab-bar.compact {
   top: 48px;
-  background: rgba(13, 17, 23, 0.92);
-  backdrop-filter: blur(40px) saturate(180%);
-  -webkit-backdrop-filter: blur(40px) saturate(180%);
   border-bottom: 1px solid var(--color-separator);
 }
 .sub-tab-item {

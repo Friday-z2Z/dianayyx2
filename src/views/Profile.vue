@@ -1,37 +1,44 @@
 <script setup>
-import { ref, inject, onMounted } from 'vue'
+import { ref, inject, onMounted, onActivated } from 'vue'
 
 const navigateTo = inject('navigateTo')
 const showContent = ref(false)
+const favCount = ref(0)
+const showAboutDialog = ref(false)
 
 const userInfo = ref({
   name: 'Diana',
   level: 'Pro',
-  id: 'ID: 8829-1024'
+  id: 'ID: 0616-1115'
 })
+
+// 动态读取收藏数量
+const loadFavCount = () => {
+  try {
+    const saved = localStorage.getItem('diana_favorites')
+    if (saved) {
+      favCount.value = JSON.parse(saved).length
+    } else {
+      favCount.value = 1
+    }
+  } catch {
+    favCount.value = 1
+  }
+}
 
 const menuGroups = ref([
   {
     title: '服务',
     items: [
       { icon: 'magic', title: '魔法棒', subtitle: '智能创作助手', badge: 'NEW', badgeType: 'accent', highlight: true, action: 'magic-wand' },
-      { icon: 'star', title: '我的收藏', badge: '12', badgeType: 'count' },
-      { icon: 'history', title: '浏览历史' },
-      { icon: 'download', title: '我的下载' }
-    ]
-  },
-  {
-    title: '通用',
-    items: [
-      { icon: 'settings', title: '设置' },
-      { icon: 'shield', title: '隐私与安全' },
-      { icon: 'help', title: '帮助与反馈' }
+      { icon: 'star', title: '我的收藏', badgeType: 'count', action: 'favorites' },
+      { icon: 'history', title: '浏览历史', action: 'browse-history' },
     ]
   },
   {
     title: '',
     items: [
-      { icon: 'about', title: '关于我们' }
+      { icon: 'about', title: '关于我们', action: 'about' }
     ]
   }
 ])
@@ -39,39 +46,53 @@ const menuGroups = ref([
 const handleItemClick = (item) => {
   if (item.action === 'magic-wand') {
     navigateTo('magic-wand')
+  } else if (item.action === 'favorites') {
+    navigateTo('favorites')
+  } else if (item.action === 'browse-history') {
+    navigateTo('browse-history')
+  } else if (item.action === 'about') {
+    showAboutDialog.value = true
   }
 }
 
 // Icon color mapping (iOS style)
-const iconColorMap = {
-  magic: '#007AFF',
-  star: '#FF9500',
-  history: '#34C759',
-  download: '#5AC8FA',
-  settings: '#8E8E93',
-  shield: '#AF52DE',
-  help: '#FF2D55',
-  about: '#8E8E93'
-}
-
 const iconBgMap = {
   magic: '#007AFF',
   star: '#FF9500',
   history: '#34C759',
-  download: '#5AC8FA',
-  settings: '#8E8E93',
-  shield: '#AF52DE',
-  help: '#FF2D55',
   about: '#8E8E93'
 }
 
 onMounted(() => {
+  loadFavCount()
   setTimeout(() => { showContent.value = true }, 50)
+})
+
+onActivated(() => {
+  loadFavCount()
 })
 </script>
 
 <template>
   <div class="profile-page">
+    <!-- 关于我们弹窗 -->
+    <Teleport to="body">
+      <transition name="dialog-fade">
+        <div v-if="showAboutDialog" class="about-overlay" @click.self="showAboutDialog = false">
+          <div class="about-card">
+            <div class="about-logo">
+              <div class="logo-circle">
+                <span>D</span>
+              </div>
+            </div>
+            <h3 class="about-title">Design for Diana</h3>
+            <p class="about-subtitle">用心打造，只为更好的体验</p>
+            <button class="about-close-btn" @click="showAboutDialog = false">知道了</button>
+          </div>
+        </div>
+      </transition>
+    </Teleport>
+
     <div class="scroll-content" :class="{ visible: showContent }">
       <!-- Large Title -->
       <header class="page-header">
@@ -132,27 +153,6 @@ onMounted(() => {
                 <circle cx="12" cy="12" r="10"/>
                 <polyline points="12 6 12 12 16 14"/>
               </svg>
-              <!-- Download -->
-              <svg v-else-if="item.icon === 'download'" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="1.8">
-                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-                <polyline points="7 10 12 15 17 10"/>
-                <line x1="12" y1="15" x2="12" y2="3"/>
-              </svg>
-              <!-- Settings -->
-              <svg v-else-if="item.icon === 'settings'" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="1.8">
-                <circle cx="12" cy="12" r="3"/>
-                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>
-              </svg>
-              <!-- Shield -->
-              <svg v-else-if="item.icon === 'shield'" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="1.8">
-                <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
-              </svg>
-              <!-- Help -->
-              <svg v-else-if="item.icon === 'help'" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="1.8">
-                <circle cx="12" cy="12" r="10"/>
-                <path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/>
-                <line x1="12" y1="17" x2="12.01" y2="17"/>
-              </svg>
               <!-- About -->
               <svg v-else-if="item.icon === 'about'" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="1.8">
                 <circle cx="12" cy="12" r="10"/>
@@ -166,7 +166,7 @@ onMounted(() => {
             </div>
             <div class="menu-trailing">
               <span v-if="item.badge && item.badgeType === 'accent'" class="badge-new">{{ item.badge }}</span>
-              <span v-else-if="item.badge && item.badgeType === 'count'" class="badge-count">{{ item.badge }}</span>
+              <span v-else-if="item.badgeType === 'count'" class="badge-count">{{ favCount }}</span>
               <svg class="chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
                 <polyline points="9 18 15 12 9 6"/>
               </svg>
@@ -175,16 +175,8 @@ onMounted(() => {
         </div>
       </section>
 
-      <!-- Logout -->
+      <!-- Version -->
       <section class="logout-section" :style="{ '--delay': '0.4s' }">
-        <button class="logout-btn">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-            <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
-            <polyline points="16 17 21 12 16 7"/>
-            <line x1="21" y1="12" x2="9" y2="12"/>
-          </svg>
-          退出登录
-        </button>
         <p class="version-text">Version 2.0.1</p>
       </section>
 
@@ -446,34 +438,6 @@ onMounted(() => {
   animation: ios-slide-up 0.5s var(--ease-out-expo) var(--delay) both;
 }
 
-.logout-btn {
-  width: 100%;
-  padding: 15px;
-  background: var(--color-surface-solid);
-  border: none;
-  border-radius: var(--radius-md);
-  color: var(--color-red);
-  font-size: 16px;
-  font-weight: 500;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  box-shadow: var(--shadow-sm);
-  transition: transform var(--duration-fast) var(--ease-spring), opacity var(--duration-fast);
-}
-
-.logout-btn:active {
-  transform: scale(0.98);
-  opacity: 0.7;
-}
-
-.logout-btn svg {
-  width: 18px;
-  height: 18px;
-}
-
 .version-text {
   font-size: 12px;
   color: var(--color-text-tertiary);
@@ -484,5 +448,94 @@ onMounted(() => {
 /* Bottom spacer */
 .tab-spacer {
   height: calc(var(--tab-bar-height) + var(--safe-bottom) + 24px);
+}
+
+/* ===== About Dialog ===== */
+.about-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  background: rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+.about-card {
+  width: 100%;
+  max-width: 280px;
+  background: var(--color-surface-solid);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  box-shadow: var(--shadow-lg);
+  text-align: center;
+  padding: 32px 24px 24px;
+}
+.about-logo {
+  margin-bottom: 20px;
+}
+.logo-circle {
+  width: 64px;
+  height: 64px;
+  border-radius: var(--radius-full);
+  background: linear-gradient(135deg, #007AFF, #5856D6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0 auto;
+}
+.logo-circle span {
+  font-size: 32px;
+  font-weight: 700;
+  color: white;
+}
+.about-title {
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--color-text-primary);
+  margin: 0 0 8px;
+  letter-spacing: -0.02em;
+}
+.about-subtitle {
+  font-size: 13px;
+  color: var(--color-text-tertiary);
+  margin: 0 0 24px;
+}
+.about-close-btn {
+  width: 100%;
+  padding: 12px;
+  border-radius: var(--radius-sm);
+  border: none;
+  background: var(--color-accent);
+  color: white;
+  font-size: 16px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all var(--duration-fast) var(--ease-spring);
+}
+.about-close-btn:active {
+  transform: scale(0.96);
+  opacity: 0.85;
+}
+
+/* Dialog transition */
+.dialog-fade-enter-active,
+.dialog-fade-leave-active {
+  transition: opacity var(--duration-normal) var(--ease-smooth);
+}
+.dialog-fade-enter-active .about-card,
+.dialog-fade-leave-active .about-card {
+  transition: transform var(--duration-normal) var(--ease-spring), opacity var(--duration-normal);
+}
+.dialog-fade-enter-from,
+.dialog-fade-leave-to {
+  opacity: 0;
+}
+.dialog-fade-enter-from .about-card,
+.dialog-fade-leave-to .about-card {
+  transform: scale(0.9);
+  opacity: 0;
 }
 </style>

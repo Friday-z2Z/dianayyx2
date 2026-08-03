@@ -4,9 +4,11 @@ import TabBar from './TabBar.vue'
 import Home from '../views/Home.vue'
 import Profile from '../views/Profile.vue'
 import MagicWand from '../views/MagicWand.vue'
+import Favorites from '../views/Favorites.vue'
+import BrowseHistory from '../views/BrowseHistory.vue'
 
 const activeTab = ref('home')
-const currentPage = ref('main') // 'main', 'magic-wand'
+const currentPage = ref('main') // 'main', 'magic-wand', 'favorites', 'browse-history'
 const slideDirection = ref('')
 
 // 使用 shallowRef 避免对组件对象进行深度响应式转换
@@ -49,6 +51,8 @@ provide('goBack', () => {
           <TabBar :active-tab="activeTab" @change="handleTabChange" />
         </div>
         <MagicWand v-else-if="currentPage === 'magic-wand'" key="magic-wand" />
+        <Favorites v-else-if="currentPage === 'favorites'" key="favorites" />
+        <BrowseHistory v-else-if="currentPage === 'browse-history'" key="browse-history" />
       </transition>
     </main>
   </div>
